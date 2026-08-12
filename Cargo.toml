@@ -15,7 +15,7 @@ default = []
 # surface, ported epoch tracker, and a NoDevice stub — mirroring the
 # pre-backend state of Borsalino/Goldenweek.
 metal = []
-vulkan = []
+vulkan = ["dep:ash"]
 # karpal-verify obligation bundles for device/buffer-lifecycle properties
 # (buffer alignment, quiescence). Lands alongside the verification seam.
 verify = []
@@ -28,8 +28,11 @@ bytemuck = { version = "1", features = ["derive"] }
 # in Borsalino (compute) and Goldenweek (graphics). Zunesha is strictly the
 # device + queues + memory + buffer layer.
 #
-# Backend dependencies are reintroduced alongside src/metal.rs / src/vulkan.rs:
+# Backend dependencies are reintroduced alongside src/metal.rs / src/vulkan.rs.
+# Vulkan is live from this release; Metal still pending.
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+ash = { version = "0.38", optional = true }
+
+# Still pending:
 #   metal  (macOS)         -> objc = "0.2"            (raw objc_msgSend FFI)
-#   vulkan (Linux/Windows) -> ash  = "0.38"           (raw Vulkan FFI)
 # verify will add: karpal-verify, karpal-proof (optional).
-# Held out of v0.1 to keep the stub-only build free of unused dependencies.

@@ -57,6 +57,9 @@
 
 mod error;
 
+#[cfg(all(feature = "vulkan", not(target_os = "macos")))]
+mod vulkan;
+
 /// GPU dispatch epoch tracking for GC safety.
 ///
 /// Ported from Borsalino. Backend-agnostic — real, tested code from v0.1,
@@ -452,24 +455,46 @@ impl Device for NoDeviceStub {
 
 /// Initialise the best available device (baseline: best compute device).
 ///
-/// v0.1: returns [`DeviceError::NoDevice`] unconditionally — backends land
-/// post-v0.1. Once present, this is cfg-gated per platform exactly like
-/// `borsalino::init`:
+/// Never requires a graphics queue — Borsalino-safe on compute-only hardware.
 ///
-/// - macOS: `metal::MetalDevice` (requires `metal` feature)
 /// - Linux / Windows: `vulkan::VulkanDevice` (requires `vulkan` feature)
+/// - macOS: `metal::MetalDevice` (requires `metal` feature) — not yet implemented
+/// - Otherwise: [`DeviceError::NoDevice`]
+#[cfg(all(feature = "vulkan", not(target_os = "macos")))]
+pub fn init() -> Result<vulkan::VulkanDevice> {
+    vulkan::VulkanDevice::init()
+}
+
+/// Initialise with an explicit memory strategy (Vulkan backend).
+#[cfg(all(feature = "vulkan", not(target_os = "macos")))]
+pub fn init_with_strategy(strategy: MemoryStrategy) -> Result<vulkan::VulkanDevice> {
+    vulkan::VulkanDevice::init_with_strategy(strategy)
+}
+
+/// Initialise with explicit capability preferences (Vulkan backend).
+///
+/// See [`InitRequest`] and [`Device::init_with`].
+#[cfg(all(feature = "vulkan", not(target_os = "macos")))]
+pub fn init_with(request: InitRequest) -> Result<vulkan::VulkanDevice> {
+    vulkan::VulkanDevice::init_with(request)
+}
+
+/// Initialise the best available device — fallback when no backend is compiled.
+#[cfg(not(all(feature = "vulkan", not(target_os = "macos"))))]
 pub fn init() -> Result<NoDeviceStub> {
     Err(DeviceError::NoDevice)
 }
 
-/// Initialise with an explicit memory strategy.
+/// Initialise with an explicit memory strategy — fallback (no backend).
+#[cfg(not(all(feature = "vulkan", not(target_os = "macos"))))]
 pub fn init_with_strategy(_strategy: MemoryStrategy) -> Result<NoDeviceStub> {
     Err(DeviceError::NoDevice)
 }
 
-/// Initialise with explicit capability preferences.
+/// Initialise with explicit capability preferences — fallback (no backend).
 ///
 /// See [`InitRequest`] and [`Device::init_with`].
+#[cfg(not(all(feature = "vulkan", not(target_os = "macos"))))]
 pub fn init_with(_request: InitRequest) -> Result<NoDeviceStub> {
     Err(DeviceError::NoDevice)
 }
@@ -530,16 +555,29 @@ mod tests {
     }
 
     #[test]
-    fn top_level_init_refuses_in_v0_1() {
-        assert!(matches!(init(), Err(DeviceError::NoDevice)));
-        assert!(matches!(
-            init_with_strategy(MemoryStrategy::Unified),
-            Err(DeviceError::NoDevice)
-        ));
-        assert!(matches!(
-            init_with(InitRequest::prefer_graphics()),
-            Err(DeviceError::NoDevice)
-        ));
+    fn top_level_init_resolves_to_a_backend() {
+        // With a backend compiled, init() resolves to a real device on capable
+        // hardware (Ok) or NoDevice if none. Without any backend, it always
+        // refuses. Either way it must not panic.
+        #[cfg(all(feature = "vulkan", not(target_os = "macos")))]
+        {
+            let _ = init();
+            let _ = init_with_strategy(MemoryStrategy::Unified);
+            let _ = init_with(InitRequest::prefer_graphics());
+        }
+
+        #[cfg(not(all(feature = "vulkan", not(target_os = "macos"))))]
+        {
+            assert!(matches!(init(), Err(DeviceError::NoDevice)));
+            assert!(matches!(
+                init_with_strategy(MemoryStrategy::Unified),
+                Err(DeviceError::NoDevice)
+            ));
+            assert!(matches!(
+                init_with(InitRequest::prefer_graphics()),
+                Err(DeviceError::NoDevice)
+            ));
+        }
     }
 
     #[test]

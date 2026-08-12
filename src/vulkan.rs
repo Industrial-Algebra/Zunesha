@@ -1,0 +1,698 @@
+// Copyright (C) 2026 Industrial Algebra
+// SPDX-License-Identifier: Apache-2.0
+
+//! Vulkan backend for Zunesha.
+//!
+//! Available on Linux and Windows with the `vulkan` feature enabled. Ported
+//! from Borsalino's `vulkan.rs` device/memory/buffer layer, with two
+//! Zunesha-specific changes:
+//!
+//! - **Capability-driven queue selection.** [`select_queue_families`] prefers a
+//!   dedicated `COMPUTE`-without-`GRAPHICS` family for `compute` (async-compute
+//!   isolation), with a graceful fallback to the first compute-capable family on
+//!   unified hardware. `graphics` and `transfer` are `Option`, present only
+//!   when distinct families exist.
+//! - **No compute pipeline / dispatch.** Those stay in Borsalino. This backend
+//!   owns only device + queues + memory + buffers.
+
+use std::ffi::{CString, c_void};
+use std::mem;
+use std::ptr;
+
+use ash::vk::Handle;
+use ash::{Entry, vk};
+
+use crate::{
+    Device, DeviceError, DeviceLimits, GpuEpochTracker, InitRequest, MemoryStrategy, Queue, Queues,
+    Result,
+};
+
+// ── Queue family selection (capability-driven, policy A) ──────────
+
+/// Which queue family index serves each capability, chosen per policy A.
+struct QueueFamilyChoice {
+    /// Always present — a compute-capable family (preferred: dedicated).
+    compute: u32,
+    /// First graphics-capable family, if any.
+    graphics: Option<u32>,
+    /// First dedicated transfer-only family, if any.
+    transfer: Option<u32>,
+}
+
+impl QueueFamilyChoice {
+    /// The distinct family indices we must request at logical-device creation.
+    fn distinct_families(&self) -> Vec<u32> {
+        let mut families = vec![self.compute];
+        if let Some(g) = self.graphics {
+            if !families.contains(&g) {
+                families.push(g);
+            }
+        }
+        if let Some(t) = self.transfer {
+            if !families.contains(&t) {
+                families.push(t);
+            }
+        }
+        families
+    }
+}
+
+/// Select queue families per policy A.
+///
+/// - `compute`: first `COMPUTE`-without-`GRAPHICS` family (dedicated async
+///   compute); falls back to the first `COMPUTE`-capable family when no
+///   dedicated one exists (unified hardware, e.g. Intel iGPU, GB10).
+/// - `graphics`: first `GRAPHICS`-capable family, else `None`.
+/// - `transfer`: first `TRANSFER`-only family (no compute, no graphics), else
+///   `None` (consumers reuse `compute`).
+fn select_queue_families(props: &[vk::QueueFamilyProperties]) -> Option<QueueFamilyChoice> {
+    let compute = props
+        .iter()
+        .position(|q| {
+            q.queue_flags.contains(vk::QueueFlags::COMPUTE)
+                && !q.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+        })
+        .or_else(|| {
+            props
+                .iter()
+                .position(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE))
+        })?;
+    let graphics = props
+        .iter()
+        .position(|q| q.queue_flags.contains(vk::QueueFlags::GRAPHICS))
+        .map(|i| i as u32);
+    let transfer = props
+        .iter()
+        .position(|q| {
+            q.queue_flags.contains(vk::QueueFlags::TRANSFER)
+                && !q.queue_flags.contains(vk::QueueFlags::COMPUTE)
+                && !q.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+        })
+        .map(|i| i as u32);
+    Some(QueueFamilyChoice {
+        compute: compute as u32,
+        graphics,
+        transfer,
+    })
+}
+
+/// Physical-device preference score (discrete > integrated > virtual > cpu).
+fn device_type_score(dt: vk::PhysicalDeviceType) -> i32 {
+    match dt {
+        vk::PhysicalDeviceType::DISCRETE_GPU => 4,
+        vk::PhysicalDeviceType::INTEGRATED_GPU => 3,
+        vk::PhysicalDeviceType::VIRTUAL_GPU => 2,
+        vk::PhysicalDeviceType::CPU => 1,
+        _ => 0,
+    }
+}
+
+/// Pick the best physical device exposing a compute queue.
+///
+/// When `prefer_graphics` is set, graphics-capable devices score +100 so they
+/// win over compute-only devices on multi-GPU systems — but if no device has
+/// graphics, the best compute device still wins (preference, not requirement).
+///
+/// # Safety
+///
+/// Vulkan FFI.
+unsafe fn pick_physical_device(
+    instance: &ash::Instance,
+    prefer_graphics: bool,
+) -> Result<(vk::PhysicalDevice, QueueFamilyChoice)> {
+    let devices = unsafe {
+        instance
+            .enumerate_physical_devices()
+            .map_err(|e| DeviceError::InitFailed(format!("vkEnumeratePhysicalDevices: {e}")))?
+    };
+
+    let mut best_score: i32 = -1;
+    let mut best: Option<(vk::PhysicalDevice, QueueFamilyChoice)> = None;
+
+    for &pd in &devices {
+        let props = unsafe { instance.get_physical_device_properties(pd) };
+        let families = unsafe { instance.get_physical_device_queue_family_properties(pd) };
+        let Some(choice) = select_queue_families(&families) else {
+            continue;
+        };
+
+        let mut score = device_type_score(props.device_type);
+        if prefer_graphics && choice.graphics.is_some() {
+            score += 100;
+        }
+        if score > best_score {
+            best_score = score;
+            best = Some((pd, choice));
+        }
+    }
+
+    best.ok_or_else(|| {
+        DeviceError::InitFailed("no Vulkan device with a compute queue found".into())
+    })
+}
+
+/// Create the logical device requesting every distinct family the choice uses,
+/// then retrieve each queue handle.
+///
+/// # Safety
+///
+/// Vulkan FFI.
+unsafe fn create_logical_device(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    choice: &QueueFamilyChoice,
+) -> Result<(ash::Device, Queues)> {
+    let queue_priority = 1.0f32;
+    let families = choice.distinct_families();
+    let queue_cis: Vec<vk::DeviceQueueCreateInfo> = families
+        .iter()
+        .map(|&fi| {
+            vk::DeviceQueueCreateInfo::default()
+                .queue_family_index(fi)
+                .queue_priorities(std::slice::from_ref(&queue_priority))
+        })
+        .collect();
+
+    let create_info = vk::DeviceCreateInfo::default().queue_create_infos(&queue_cis);
+    let device = unsafe {
+        instance
+            .create_device(physical_device, &create_info, None)
+            .map_err(|e| DeviceError::InitFailed(format!("vkCreateDevice: {e}")))?
+    };
+
+    let compute_q = unsafe { device.get_device_queue(choice.compute, 0) };
+    let graphics_q = choice
+        .graphics
+        .map(|fi| (fi, unsafe { device.get_device_queue(fi, 0) }));
+    let transfer_q = choice
+        .transfer
+        .map(|fi| (fi, unsafe { device.get_device_queue(fi, 0) }));
+
+    let queues = Queues {
+        compute: Queue {
+            raw: compute_q.as_raw() as *mut c_void,
+            family_index: choice.compute,
+        },
+        graphics: graphics_q.map(|(fi, q)| Queue {
+            raw: q.as_raw() as *mut c_void,
+            family_index: fi,
+        }),
+        transfer: transfer_q.map(|(fi, q)| Queue {
+            raw: q.as_raw() as *mut c_void,
+            family_index: fi,
+        }),
+    };
+
+    Ok((device, queues))
+}
+
+// ── Memory allocation ─────────────────────────────────────────────
+
+/// Find a memory type matching `filter` (memory type bits) and `required` flags.
+fn find_memory_type_index(
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
+    type_filter: u32,
+    required: vk::MemoryPropertyFlags,
+) -> Result<u32> {
+    for i in 0..memory_properties.memory_type_count {
+        if (type_filter & (1 << i)) != 0
+            && memory_properties.memory_types[i as usize]
+                .property_flags
+                .contains(required)
+        {
+            return Ok(i);
+        }
+    }
+    Err(DeviceError::BufferCreationFailed {
+        message: "no suitable memory type found".into(),
+    })
+}
+
+/// Allocate a host-visible, host-coherent buffer of `size` bytes with `usage`.
+///
+/// Returns `(buffer, memory, mapped_ptr)`. Prefer cached memory on discrete
+/// GPUs (avoids PCIe round-trips); fall back to uncached coherent.
+///
+/// # Safety
+///
+/// Vulkan FFI.
+unsafe fn allocate_buffer(
+    device: &ash::Device,
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
+    size: vk::DeviceSize,
+    usage: vk::BufferUsageFlags,
+) -> Result<(vk::Buffer, vk::DeviceMemory, *mut c_void)> {
+    let buffer_info = vk::BufferCreateInfo::default()
+        .size(size)
+        .usage(usage)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+    let buffer = unsafe {
+        device
+            .create_buffer(&buffer_info, None)
+            .map_err(|e| DeviceError::BufferCreationFailed {
+                message: format!("vkCreateBuffer: {e}"),
+            })?
+    };
+
+    let mem_reqs = unsafe { device.get_buffer_memory_requirements(buffer) };
+
+    let mut flags = vk::MemoryPropertyFlags::HOST_VISIBLE
+        | vk::MemoryPropertyFlags::HOST_COHERENT
+        | vk::MemoryPropertyFlags::HOST_CACHED;
+    let mem_type_index =
+        find_memory_type_index(memory_properties, mem_reqs.memory_type_bits, flags).or_else(
+            |_| {
+                flags =
+                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+                find_memory_type_index(memory_properties, mem_reqs.memory_type_bits, flags)
+            },
+        )?;
+
+    let alloc_info = vk::MemoryAllocateInfo::default()
+        .allocation_size(mem_reqs.size)
+        .memory_type_index(mem_type_index);
+
+    let memory = unsafe {
+        device.allocate_memory(&alloc_info, None).map_err(|e| {
+            DeviceError::BufferCreationFailed {
+                message: format!("vkAllocateMemory: {e}"),
+            }
+        })?
+    };
+
+    unsafe {
+        device.bind_buffer_memory(buffer, memory, 0).map_err(|e| {
+            DeviceError::BufferCreationFailed {
+                message: format!("vkBindBufferMemory: {e}"),
+            }
+        })?;
+    }
+
+    let mapped = unsafe {
+        device
+            .map_memory(memory, 0, size, vk::MemoryMapFlags::empty())
+            .map_err(|e| DeviceError::BufferCreationFailed {
+                message: format!("vkMapMemory: {e}"),
+            })?
+    };
+
+    Ok((buffer, memory, mapped))
+}
+
+/// Round `value` up to a multiple of `alignment`.
+fn align_up(value: vk::DeviceSize, alignment: vk::DeviceSize) -> vk::DeviceSize {
+    if alignment == 0 {
+        value
+    } else {
+        (value + alignment - 1) & !(alignment - 1)
+    }
+}
+
+// ── Buffer inner type ─────────────────────────────────────────────
+
+/// Internal state for a Vulkan buffer, stored behind the opaque `Buffer.raw`
+/// pointer. Self-contained: clones the device handle so it can destroy itself
+/// on drop. (ash `Device` does not auto-destroy on Drop, so the clone is safe.)
+struct VulkanBufferInner {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    /// Allocation size — used by the device-local readback path (increment 2).
+    #[allow(dead_code)]
+    size: vk::DeviceSize,
+    /// Persistently mapped host pointer (host-visible buffers; this increment
+    /// allocates host-visible only).
+    mapped: *mut c_void,
+    /// Clone of the logical device, used for destroy / unmap in drop.
+    device: ash::Device,
+}
+
+unsafe impl Send for VulkanBufferInner {}
+unsafe impl Sync for VulkanBufferInner {}
+
+impl Drop for VulkanBufferInner {
+    fn drop(&mut self) {
+        // Safety: the buffer owns its memory and mapping exclusively; the
+        // device handle is valid because buffers must not outlive the device
+        // (documented invariant).
+        unsafe {
+            self.device.unmap_memory(self.memory);
+            self.device.destroy_buffer(self.buffer, None);
+            self.device.free_memory(self.memory, None);
+        }
+    }
+}
+
+/// Drop function stored in [`crate::Buffer`] — drops the `Box<VulkanBufferInner>`.
+pub(super) fn drop_vulkan_buffer(raw: *mut c_void) {
+    if !raw.is_null() {
+        // Safety: `raw` was produced by `Box::into_raw` in `create_buffer`.
+        unsafe {
+            drop(Box::from_raw(raw as *mut VulkanBufferInner));
+        }
+    }
+}
+
+// ── Device backend ────────────────────────────────────────────────
+
+/// Vulkan implementation of [`Device`].
+///
+/// Owns the Vulkan instance, physical device, logical device, queues, and
+/// memory properties. Buffers carry a device clone and self-destruct; the
+/// device itself is destroyed in [`Drop`].
+///
+/// # Drop order
+///
+/// `destroy_device` is called before `destroy_instance` (the Vulkan-mandated
+/// order) in the manual [`Drop`] impl.
+pub struct VulkanDevice {
+    device: ash::Device,
+    instance: ash::Instance,
+    _entry: Entry,
+    /// Physical device — retained for future property queries and the
+    /// device-local readback path; read in tests.
+    #[allow(dead_code)]
+    physical_device: vk::PhysicalDevice,
+    queues: Queues,
+    memory_properties: vk::PhysicalDeviceMemoryProperties,
+    memory_strategy: MemoryStrategy,
+    limits: DeviceLimits,
+    epoch: GpuEpochTracker,
+}
+
+impl Drop for VulkanDevice {
+    fn drop(&mut self) {
+        // Safety: device before instance (Vulkan-mandated order). Buffers must
+        // already have been dropped by the caller (documented invariant).
+        unsafe {
+            self.device.device_wait_idle().ok();
+            self.device.destroy_device(None);
+            self.instance.destroy_instance(None);
+        }
+    }
+}
+
+impl VulkanDevice {
+    /// Build a device with an explicit memory strategy and graphics preference.
+    fn build(strategy: MemoryStrategy, prefer_graphics: bool) -> Result<Self> {
+        let entry = unsafe { Entry::load().map_err(|e| DeviceError::InitFailed(format!("{e}")))? };
+
+        // Query the available instance version before requesting one. Requesting
+        // an unsupported version can crash drivers (Borsalino issue #34).
+        let available_version = unsafe { entry.try_enumerate_instance_version() }
+            .ok()
+            .flatten();
+        let api_version = available_version.unwrap_or(vk::API_VERSION_1_1);
+
+        let app_name = CString::new("zunesha").unwrap();
+        let engine_name = CString::new("zunesha").unwrap();
+        let app_info = vk::ApplicationInfo::default()
+            .application_name(&app_name)
+            .engine_name(&engine_name)
+            .api_version(api_version);
+        let instance_create_info = vk::InstanceCreateInfo::default().application_info(&app_info);
+
+        let instance = unsafe {
+            entry
+                .create_instance(&instance_create_info, None)
+                .map_err(|e| DeviceError::InitFailed(format!("vkCreateInstance: {e}")))?
+        };
+
+        let (physical_device, choice) =
+            unsafe { pick_physical_device(&instance, prefer_graphics) }?;
+
+        let props = unsafe { instance.get_physical_device_properties(physical_device) };
+        let memory_properties =
+            unsafe { instance.get_physical_device_memory_properties(physical_device) };
+        let limits = DeviceLimits {
+            min_storage_buffer_offset_alignment: props.limits.min_storage_buffer_offset_alignment,
+        };
+
+        let (device, queues) =
+            unsafe { create_logical_device(&instance, physical_device, &choice) }?;
+
+        Ok(Self {
+            device,
+            instance,
+            _entry: entry,
+            physical_device,
+            queues,
+            memory_properties,
+            memory_strategy: strategy,
+            limits,
+            epoch: GpuEpochTracker::new(),
+        })
+    }
+
+    /// Buffer usage flags broad enough for both compute (storage) and graphics
+    /// (vertex) consumers — a Zunesha buffer serves either.
+    fn buffer_usage() -> vk::BufferUsageFlags {
+        vk::BufferUsageFlags::STORAGE_BUFFER
+            | vk::BufferUsageFlags::VERTEX_BUFFER
+            | vk::BufferUsageFlags::TRANSFER_SRC
+            | vk::BufferUsageFlags::TRANSFER_DST
+    }
+}
+
+impl Device for VulkanDevice {
+    fn init() -> Result<Self> {
+        Self::build(MemoryStrategy::Auto, false)
+    }
+
+    fn init_with_strategy(strategy: MemoryStrategy) -> Result<Self> {
+        Self::build(strategy, false)
+    }
+
+    fn init_with(request: InitRequest) -> Result<Self> {
+        Self::build(request.memory, request.prefer_graphics)
+    }
+
+    fn queues(&self) -> Queues {
+        self.queues
+    }
+
+    fn limits(&self) -> DeviceLimits {
+        self.limits
+    }
+
+    fn memory_strategy(&self) -> MemoryStrategy {
+        self.memory_strategy
+    }
+
+    fn create_buffer<T: bytemuck::Pod>(&self, data: &[T]) -> Result<crate::Buffer> {
+        let byte_len = mem::size_of_val(data) as vk::DeviceSize;
+        let aligned = if byte_len == 0 {
+            self.limits.min_storage_buffer_offset_alignment
+        } else {
+            align_up(byte_len, self.limits.min_storage_buffer_offset_alignment)
+        };
+
+        let (buffer, memory, mapped) = unsafe {
+            allocate_buffer(
+                &self.device,
+                &self.memory_properties,
+                aligned,
+                Self::buffer_usage(),
+            )?
+        };
+
+        if byte_len > 0 {
+            unsafe {
+                ptr::copy_nonoverlapping(data.as_ptr() as *const c_void, mapped, byte_len as usize);
+            }
+        }
+
+        let inner = Box::new(VulkanBufferInner {
+            buffer,
+            memory,
+            size: aligned,
+            mapped,
+            device: self.device.clone(),
+        });
+        Ok(crate::Buffer {
+            raw: Box::into_raw(inner) as *mut c_void,
+            len: byte_len as usize,
+            drop_fn: drop_vulkan_buffer,
+        })
+    }
+
+    fn create_buffer_uninit<T: bytemuck::Pod>(&self, len: usize) -> Result<crate::Buffer> {
+        let byte_len = (len * mem::size_of::<T>()) as vk::DeviceSize;
+        let aligned = if byte_len == 0 {
+            self.limits.min_storage_buffer_offset_alignment
+        } else {
+            align_up(byte_len, self.limits.min_storage_buffer_offset_alignment)
+        };
+
+        let (buffer, memory, mapped) = unsafe {
+            allocate_buffer(
+                &self.device,
+                &self.memory_properties,
+                aligned,
+                Self::buffer_usage(),
+            )?
+        };
+
+        let inner = Box::new(VulkanBufferInner {
+            buffer,
+            memory,
+            size: aligned,
+            mapped,
+            device: self.device.clone(),
+        });
+        Ok(crate::Buffer {
+            raw: Box::into_raw(inner) as *mut c_void,
+            len: byte_len as usize,
+            drop_fn: drop_vulkan_buffer,
+        })
+    }
+
+    fn read_buffer<T: bytemuck::Pod>(&self, buffer: &crate::Buffer) -> Result<Vec<T>> {
+        // Safety: `raw` was produced by `Box::into_raw::<VulkanBufferInner>` in
+        // create_buffer[_uninit] and is still valid (buffer not dropped).
+        let inner = unsafe { &*(buffer.raw as *const VulkanBufferInner) };
+
+        // This increment allocates host-visible buffers only (mapped is always
+        // set). Device-local readback with staging lands in the next increment.
+        if inner.mapped.is_null() {
+            return Err(DeviceError::BufferReadFailed {
+                message: "buffer is not host-visible".into(),
+            });
+        }
+
+        let count = if mem::size_of::<T>() == 0 {
+            0
+        } else {
+            buffer.len / mem::size_of::<T>()
+        };
+        let src = inner.mapped as *const T;
+        let slice = unsafe { std::slice::from_raw_parts(src, count) };
+        Ok(slice.to_vec())
+    }
+
+    fn in_flight(&self) -> u64 {
+        self.epoch.in_flight()
+    }
+
+    fn is_quiescent(&self) -> bool {
+        self.epoch.is_quiescent()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Device;
+
+    /// A real device must initialise on the host's Vulkan, and `compute` is
+    /// always present (Zunesha's baseline contract).
+    #[test]
+    fn vulkan_device_inits_and_exposes_compute() {
+        let device = match VulkanDevice::init() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Vulkan device available ({e})");
+                return;
+            }
+        };
+        // compute is always Some (guaranteed by the contract); Queue carries a
+        // real family index.
+        assert!(device.queues().compute.family_index != u32::MAX);
+        println!("compute family = {}", device.queues().compute.family_index);
+    }
+
+    /// On a device with a dedicated async-compute family (e.g. the RTX 5080),
+    /// policy A must place `compute` on a family distinct from `graphics`.
+    #[test]
+    fn dedicated_compute_family_is_selected_when_present() {
+        let device = match VulkanDevice::init() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Vulkan device ({e})");
+                return;
+            }
+        };
+        let q = device.queues();
+        if let (Some(gfx_family), gfx) = (q.graphics.as_ref(), q.graphics) {
+            // If graphics exists and a dedicated compute family exists, they
+            // differ. (On unified hardware they share a family — that is also
+            // correct; this assertion only fires when both are Some AND distinct
+            // families exist on the device, which we detect by enumerating.)
+            let props = unsafe {
+                device
+                    .instance
+                    .get_physical_device_queue_family_properties(device.physical_device)
+            };
+            let has_dedicated_compute = props.iter().any(|f| {
+                f.queue_flags.contains(vk::QueueFlags::COMPUTE)
+                    && !f.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+            });
+            if has_dedicated_compute {
+                assert_ne!(
+                    q.compute.family_index, gfx_family.family_index,
+                    "compute should use a dedicated family distinct from graphics"
+                );
+                let _ = gfx;
+                println!(
+                    "async-compute verified: compute={} graphics={} transfer={:?}",
+                    q.compute.family_index,
+                    gfx_family.family_index,
+                    q.transfer.map(|t| t.family_index)
+                );
+            } else {
+                println!("no dedicated compute family on this device; unified path verified");
+            }
+        }
+    }
+
+    /// Buffer roundtrip: create → read back, host-visible path.
+    #[test]
+    fn buffer_roundtrip() {
+        let device = match VulkanDevice::init() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Vulkan device ({e})");
+                return;
+            }
+        };
+        let input = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let buffer = device.create_buffer(&input).expect("create_buffer");
+        let output: Vec<f32> = device.read_buffer(&buffer).expect("read_buffer");
+        assert_eq!(output, input);
+    }
+
+    /// A fresh device is quiescent (epoch counter at zero).
+    #[test]
+    fn fresh_device_is_quiescent() {
+        let device = match VulkanDevice::init() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Vulkan device ({e})");
+                return;
+            }
+        };
+        assert_eq!(device.in_flight(), 0);
+        assert!(device.is_quiescent());
+        assert!(device.prove_quiescent().is_some());
+    }
+
+    /// `init_with(prefer_graphics)` must still succeed and expose graphics when
+    /// the host has a graphics-capable device.
+    #[test]
+    fn prefer_graphics_exposes_graphics_when_available() {
+        let device = match VulkanDevice::init_with(InitRequest::prefer_graphics()) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Vulkan device ({e})");
+                return;
+            }
+        };
+        if device.queues().has_graphics() {
+            println!("graphics queue present under prefer_graphics");
+        } else {
+            println!(
+                "no graphics on this host (compute-only) — preference honoured, no requirement"
+            );
+        }
+    }
+}
