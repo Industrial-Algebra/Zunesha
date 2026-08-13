@@ -105,7 +105,14 @@ pub enum MemoryStrategy {
 pub struct InitRequest {
     /// Memory allocation strategy.
     pub memory: MemoryStrategy,
-    /// Prefer a graphics-capable physical device during selection scoring.
+    /// Request graphics readiness: prefer a graphics-capable physical device
+    /// *and* enable presentation extensions.
+    ///
+    /// Under the Vulkan backend this both biases device selection toward a
+    /// graphics-capable adapter and enables surface-related instance/device
+    /// extensions (`VK_KHR_surface`, `VK_KHR_swapchain`, platform surface
+    /// extensions, and `VK_EXT_headless_surface` for testing) — each only if
+    /// the driver supports it.
     ///
     /// A *preference*, not a requirement: if no graphics-capable device exists,
     /// Zunesha still returns the best compute device and
@@ -502,6 +509,7 @@ pub fn init_with(_request: InitRequest) -> Result<NoDeviceStub> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn memory_strategy_default_is_auto() {
@@ -555,6 +563,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn top_level_init_resolves_to_a_backend() {
         // With a backend compiled, init() resolves to a real device on capable
         // hardware (Ok) or NoDevice if none. Without any backend, it always

@@ -15,7 +15,8 @@
 //! - **No compute pipeline / dispatch.** Those stay in Borsalino. This backend
 //!   owns only device + queues + memory + buffers.
 
-use std::ffi::{CString, c_void};
+use std::collections::HashSet;
+use std::ffi::{CStr, CString, c_char, c_void};
 use std::mem;
 use std::ptr;
 
@@ -151,9 +152,70 @@ unsafe fn pick_physical_device(
     })
 }
 
+// ── Extension negotiation (graphics readiness) ───────────────────
+
+/// Instance extensions Zunesha requests when a caller wants graphics, so the
+/// caller can create whichever surface it needs (platform or headless). Each is
+/// enabled only if the loader reports it available — unsupported extensions are
+/// silently skipped, so compute-only drivers never fail here.
+const INSTANCE_SURFACE_EXTENSIONS: &[&CStr] = &[
+    // Universal surface base extension.
+    c"VK_KHR_surface",
+    // Headless rendering (tests, CI, headless servers). Harmless when unused.
+    c"VK_EXT_headless_surface",
+    // Platform window-system surfaces.
+    c"VK_KHR_xlib_surface",
+    c"VK_KHR_xcb_surface",
+    c"VK_KHR_wayland_surface",
+    c"VK_KHR_win32_surface",
+    c"VK_KHR_android_surface",
+    c"VK_EXT_metal_surface",
+];
+
+/// The swapchain device extension, requested alongside a graphics queue so a
+/// consumer can build a swapchain.
+const SWAPCHAIN_EXTENSION: &CStr = c"VK_KHR_swapchain";
+
+/// Set of instance extension names the loader reports as available.
+fn available_instance_extensions(entry: &Entry) -> HashSet<CString> {
+    unsafe { entry.enumerate_instance_extension_properties(None) }
+        .map(|props| {
+            props
+                .iter()
+                .map(|p| {
+                    // Safety: `extension_name` is a NUL-terminated array
+                    // populated by the loader.
+                    unsafe { CStr::from_ptr(p.extension_name.as_ptr()) }.to_owned()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Set of device extension names the physical device reports as available.
+///
+/// # Safety
+///
+/// Vulkan FFI.
+unsafe fn available_device_extensions(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+) -> HashSet<CString> {
+    unsafe { instance.enumerate_device_extension_properties(physical_device) }
+        .map(|props| {
+            props
+                .iter()
+                .map(|p| unsafe { CStr::from_ptr(p.extension_name.as_ptr()) }.to_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Create the logical device requesting every distinct family the choice uses,
 /// then retrieve each queue handle. Returns the device, the public [`Queues`],
-/// and the compute queue handle (used for staging transfers).
+/// and the compute queue handle (used for staging transfers). When
+/// `enabled_device_extensions` is non-empty (graphics requested), they are
+/// passed to `vkCreateDevice`.
 ///
 /// # Safety
 ///
@@ -162,6 +224,7 @@ unsafe fn create_logical_device(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
     choice: &QueueFamilyChoice,
+    enabled_device_extensions: &[*const c_char],
 ) -> Result<(ash::Device, Queues, vk::Queue)> {
     let queue_priority = 1.0f32;
     let families = choice.distinct_families();
@@ -174,7 +237,9 @@ unsafe fn create_logical_device(
         })
         .collect();
 
-    let create_info = vk::DeviceCreateInfo::default().queue_create_infos(&queue_cis);
+    let create_info = vk::DeviceCreateInfo::default()
+        .queue_create_infos(&queue_cis)
+        .enabled_extension_names(enabled_device_extensions);
     let device = unsafe {
         instance
             .create_device(physical_device, &create_info, None)
@@ -509,8 +574,8 @@ pub struct VulkanDevice {
     device: ash::Device,
     instance: ash::Instance,
     _entry: Entry,
-    /// Physical device — retained for future property queries; read in tests.
-    #[allow(dead_code)]
+    /// Physical device — exposed via [`VulkanDevice::physical_device`] for
+    /// consumers (Goldenweek) that query surface capabilities.
     physical_device: vk::PhysicalDevice,
     queues: Queues,
     /// Compute queue handle, used for staging transfers.
@@ -557,7 +622,23 @@ impl VulkanDevice {
             .application_name(&app_name)
             .engine_name(&engine_name)
             .api_version(api_version);
-        let instance_create_info = vk::InstanceCreateInfo::default().application_info(&app_info);
+        // When graphics is requested, enable every available surface-related
+        // instance extension so the caller can create whichever surface it needs
+        // (platform or headless). Unsupported extensions are skipped, so a
+        // compute-only loader never fails here.
+        let instance_extensions: Vec<*const c_char> = if prefer_graphics {
+            let available = available_instance_extensions(&entry);
+            INSTANCE_SURFACE_EXTENSIONS
+                .iter()
+                .filter(|ext| available.contains(**ext))
+                .map(|ext| ext.as_ptr())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let instance_create_info = vk::InstanceCreateInfo::default()
+            .application_info(&app_info)
+            .enabled_extension_names(&instance_extensions);
 
         let instance = unsafe {
             entry
@@ -575,8 +656,22 @@ impl VulkanDevice {
             min_storage_buffer_offset_alignment: props.limits.min_storage_buffer_offset_alignment,
         };
 
-        let (device, queues, compute_queue) =
-            unsafe { create_logical_device(&instance, physical_device, &choice) }?;
+        // Enable the swapchain device extension when graphics is requested and
+        // the chosen physical device supports it (compute-only HW will not).
+        let device_extensions: Vec<*const c_char> = if prefer_graphics {
+            let available = unsafe { available_device_extensions(&instance, physical_device) };
+            if available.contains(SWAPCHAIN_EXTENSION) {
+                vec![SWAPCHAIN_EXTENSION.as_ptr()]
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
+        let (device, queues, compute_queue) = unsafe {
+            create_logical_device(&instance, physical_device, &choice, &device_extensions)
+        }?;
 
         // Transient transfer command pool on the compute family (compute always
         // supports transfer; dedicated transfer family is exposed to consumers
@@ -619,6 +714,37 @@ impl VulkanDevice {
             | vk::BufferUsageFlags::VERTEX_BUFFER
             | vk::BufferUsageFlags::TRANSFER_SRC
             | vk::BufferUsageFlags::TRANSFER_DST
+    }
+
+    /// Raw Vulkan instance handle.
+    ///
+    /// Exposed so graphics consumers (Goldenweek) can create a surface against
+    /// the instance that owns this device, and query surface capabilities.
+    #[must_use]
+    pub fn raw_instance(&self) -> ash::Instance {
+        self.instance.clone()
+    }
+
+    /// Raw Vulkan logical-device handle (a cheap clone — `ash::Device` is a
+    /// refcount-free handle wrapper; the original is destroyed in [`Drop`]).
+    ///
+    /// Graphics consumers use this to build swapchains, render passes, and
+    /// pipelines against this device.
+    #[must_use]
+    pub fn raw_device(&self) -> ash::Device {
+        self.device.clone()
+    }
+
+    /// Raw physical-device handle, for surface-format and capability queries.
+    #[must_use]
+    pub fn physical_device(&self) -> vk::PhysicalDevice {
+        self.physical_device
+    }
+
+    /// Physical-device memory properties, for image/memory allocation by
+    /// graphics consumers (e.g. offscreen render targets).
+    pub fn memory_properties(&self) -> vk::PhysicalDeviceMemoryProperties {
+        self.memory_properties
     }
 }
 
@@ -822,10 +948,48 @@ impl Device for VulkanDevice {
 mod tests {
     use super::*;
     use crate::Device;
+    use serial_test::serial;
+
+    /// A graphics-requested init selects a device exposing a graphics queue and
+    /// supporting `VK_KHR_swapchain` (the rendering prerequisite). On a
+    /// compute-only host neither is guaranteed — the test then reports the
+    /// degradation instead of asserting.
+    #[test]
+    #[serial]
+    fn graphics_init_enables_swapchain_and_graphics_queue() {
+        let device = match VulkanDevice::init_with(InitRequest::prefer_graphics()) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Vulkan device ({e})");
+                return;
+            }
+        };
+        let q = device.queues();
+        // Exercise the raw-handle accessors that Goldenweek will consume.
+        let inst = device.raw_instance();
+        let pd = device.physical_device();
+        let available = unsafe { available_device_extensions(&inst, pd) };
+        let swapchain_supported = available.contains(SWAPCHAIN_EXTENSION);
+        if q.has_graphics() {
+            assert!(
+                swapchain_supported,
+                "graphics queue present but VK_KHR_swapchain unsupported"
+            );
+            println!(
+                "graphics-ready: graphics family = {:?}, VK_KHR_swapchain supported",
+                q.graphics.map(|g| g.family_index)
+            );
+        } else {
+            println!(
+                "compute-only host (no graphics queue); swapchain_supported = {swapchain_supported}"
+            );
+        }
+    }
 
     /// A real device must initialise on the host's Vulkan, and `compute` is
     /// always present (Zunesha's baseline contract).
     #[test]
+    #[serial]
     fn vulkan_device_inits_and_exposes_compute() {
         let device = match VulkanDevice::init() {
             Ok(d) => d,
@@ -844,6 +1008,7 @@ mod tests {
     /// On a device with a dedicated async-compute family (e.g. the RTX 5080),
     /// policy A must place `compute` on a family distinct from `graphics`.
     #[test]
+    #[serial]
     fn dedicated_compute_family_is_selected_when_present() {
         let device = match VulkanDevice::init() {
             Ok(d) => d,
@@ -882,6 +1047,7 @@ mod tests {
 
     /// Host-visible (unified) buffer roundtrip.
     #[test]
+    #[serial]
     fn buffer_roundtrip_unified() {
         let device = match VulkanDevice::init_with_strategy(MemoryStrategy::Unified) {
             Ok(d) => d,
@@ -899,6 +1065,7 @@ mod tests {
     /// Device-local (VRAM) buffer roundtrip — exercises the staging path
     /// (data → staging → device, then device → staging → read).
     #[test]
+    #[serial]
     fn buffer_roundtrip_device_local() {
         let device = match VulkanDevice::init_with_strategy(MemoryStrategy::DeviceLocal) {
             Ok(d) => d,
@@ -923,6 +1090,7 @@ mod tests {
 
     /// A fresh device is quiescent (epoch counter at zero).
     #[test]
+    #[serial]
     fn fresh_device_is_quiescent() {
         let device = match VulkanDevice::init() {
             Ok(d) => d,
@@ -939,6 +1107,7 @@ mod tests {
     /// `init_with(prefer_graphics)` exposes graphics when the host has a
     /// graphics-capable device.
     #[test]
+    #[serial]
     fn prefer_graphics_exposes_graphics_when_available() {
         let device = match VulkanDevice::init_with(InitRequest::prefer_graphics()) {
             Ok(d) => d,

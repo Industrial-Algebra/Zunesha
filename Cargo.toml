@@ -33,6 +33,13 @@ bytemuck = { version = "1", features = ["derive"] }
 [target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
 ash = { version = "0.38", optional = true }
 
+[dev-dependencies]
+# GPU tests touch the Vulkan loader, which is not safe under concurrent
+# instance/device creation (SIGSEGV when a WSI-enabled instance is created in
+# parallel with a plain one). `#[serial]` keeps the vulkan tests from racing
+# the loader.
+serial_test = "3"
+
 # Still pending:
 #   metal  (macOS)         -> objc = "0.2"            (raw objc_msgSend FFI)
 # verify will add: karpal-verify, karpal-proof (optional).

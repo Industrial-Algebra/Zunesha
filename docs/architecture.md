@@ -105,6 +105,20 @@ The [`Device`](../src/lib.rs) trait is the contract. Its essentials:
   last yields a `QuiescenceProof` a caller can hold as evidence that all
   in-flight work is done).
 
+### Graphics seam (concrete `VulkanDevice`)
+
+The backend-agnostic `Device` trait deliberately exposes nothing
+Vulkan-specific. But a graphics consumer (Goldenweek) needs the raw instance,
+device, and physical-device handles to build a swapchain and a surface. Those
+are exposed as **inherent methods on the concrete `zunesha::vulkan::VulkanDevice`**
+(not the trait): `raw_instance()`, `raw_device()`, `physical_device()`,
+`memory_properties()`. This keeps the trait clean while letting a sibling
+concrete backend reach the handles it needs — see
+[ADR 0001](adr/0001-shared-device-substrate.md). Construction with
+`prefer_graphics` additionally enables `VK_KHR_surface`, `VK_KHR_swapchain`,
+the platform surface extensions, and `VK_EXT_headless_surface` (for headless
+testing), each only if the driver supports it.
+
 ### Memory placement
 
 `MemoryStrategy` (`Auto` | `Unified` | `DeviceLocal`) controls buffer placement.
