@@ -6,6 +6,14 @@ Shared GPU **device substrate** for the Industrial Algebra ecosystem.
 
 > The immortal elephant that carries compute and graphics on its back.
 
+## Documentation
+
+- **[docs/architecture.md](docs/architecture.md)** — purpose, the three-tensions assessment, and position in the stack.
+- **Decision records** in [docs/adr/](docs/adr/):
+  - [0001 — Shared device substrate](docs/adr/0001-shared-device-substrate.md)
+  - [0002 — Capability-driven queues](docs/adr/0002-capability-driven-queues.md)
+  - [0003 — Cross-crate proof agreement](docs/adr/0003-cross-crate-proof-agreement.md)
+
 Zunesha owns the one thing [Borsalino](https://github.com/Industrial-Algebra/Borsalino)
 (compute) and [Goldenweek](https://github.com/Industrial-Algebra/Goldenweek)
 (graphics) genuinely share — the **GPU device**: physical-device selection,
