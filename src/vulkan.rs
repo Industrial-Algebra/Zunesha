@@ -152,7 +152,8 @@ unsafe fn pick_physical_device(
 }
 
 /// Create the logical device requesting every distinct family the choice uses,
-/// then retrieve each queue handle.
+/// then retrieve each queue handle. Returns the device, the public [`Queues`],
+/// and the compute queue handle (used for staging transfers).
 ///
 /// # Safety
 ///
@@ -161,7 +162,7 @@ unsafe fn create_logical_device(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
     choice: &QueueFamilyChoice,
-) -> Result<(ash::Device, Queues)> {
+) -> Result<(ash::Device, Queues, vk::Queue)> {
     let queue_priority = 1.0f32;
     let families = choice.distinct_families();
     let queue_cis: Vec<vk::DeviceQueueCreateInfo> = families
@@ -203,7 +204,7 @@ unsafe fn create_logical_device(
         }),
     };
 
-    Ok((device, queues))
+    Ok((device, queues, compute_q))
 }
 
 // ── Memory allocation ─────────────────────────────────────────────
@@ -300,6 +301,137 @@ unsafe fn allocate_buffer(
     Ok((buffer, memory, mapped))
 }
 
+/// Allocate a device-local buffer of `size` bytes with `usage` (not mapped —
+/// transfers require staging).
+///
+/// # Safety
+///
+/// Vulkan FFI.
+unsafe fn allocate_device_local_buffer(
+    device: &ash::Device,
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
+    size: vk::DeviceSize,
+    usage: vk::BufferUsageFlags,
+) -> Result<(vk::Buffer, vk::DeviceMemory)> {
+    let buffer_info = vk::BufferCreateInfo::default()
+        .size(size)
+        .usage(usage)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+    let buffer = unsafe {
+        device
+            .create_buffer(&buffer_info, None)
+            .map_err(|e| DeviceError::BufferCreationFailed {
+                message: format!("vkCreateBuffer(device-local): {e}"),
+            })?
+    };
+
+    let mem_reqs = unsafe { device.get_buffer_memory_requirements(buffer) };
+    let mem_type_index = find_memory_type_index(
+        memory_properties,
+        mem_reqs.memory_type_bits,
+        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+    )?;
+
+    let alloc_info = vk::MemoryAllocateInfo::default()
+        .allocation_size(mem_reqs.size)
+        .memory_type_index(mem_type_index);
+
+    let memory = unsafe {
+        device.allocate_memory(&alloc_info, None).map_err(|e| {
+            DeviceError::BufferCreationFailed {
+                message: format!("vkAllocateMemory(device-local): {e}"),
+            }
+        })?
+    };
+
+    unsafe {
+        device.bind_buffer_memory(buffer, memory, 0).map_err(|e| {
+            DeviceError::BufferCreationFailed {
+                message: format!("vkBindBufferMemory(device-local): {e}"),
+            }
+        })?;
+    }
+
+    Ok((buffer, memory))
+}
+
+/// Record and submit a one-time transfer command buffer, then wait for it.
+///
+/// # Safety
+///
+/// Vulkan FFI.
+unsafe fn one_shot_transfer(
+    device: &ash::Device,
+    command_pool: vk::CommandPool,
+    queue: vk::Queue,
+    record: impl FnOnce(vk::CommandBuffer),
+) -> Result<()> {
+    unsafe {
+        let alloc_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let cmd = device.allocate_command_buffers(&alloc_info).map_err(|e| {
+            DeviceError::BufferCreationFailed {
+                message: format!("transfer allocate: {e}"),
+            }
+        })?[0];
+
+        let begin_info = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        device.begin_command_buffer(cmd, &begin_info).map_err(|e| {
+            DeviceError::BufferCreationFailed {
+                message: format!("transfer begin: {e}"),
+            }
+        })?;
+
+        record(cmd);
+
+        device
+            .end_command_buffer(cmd)
+            .map_err(|e| DeviceError::BufferCreationFailed {
+                message: format!("transfer end: {e}"),
+            })?;
+
+        let submit_info = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
+        device
+            .queue_submit(queue, std::slice::from_ref(&submit_info), vk::Fence::null())
+            .map_err(|e| DeviceError::BufferCreationFailed {
+                message: format!("transfer submit: {e}"),
+            })?;
+        device
+            .queue_wait_idle(queue)
+            .map_err(|e| DeviceError::BufferCreationFailed {
+                message: format!("transfer wait: {e}"),
+            })?;
+
+        device.free_command_buffers(command_pool, std::slice::from_ref(&cmd));
+        Ok(())
+    }
+}
+
+/// Detect whether device-local memory should be used under `Auto` strategy:
+/// discrete GPUs, or any device with a >1 GB DEVICE_LOCAL heap, get VRAM.
+fn detect_device_local(
+    device_type: vk::PhysicalDeviceType,
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
+) -> bool {
+    if device_type == vk::PhysicalDeviceType::DISCRETE_GPU {
+        return true;
+    }
+    for i in 0..memory_properties.memory_heap_count {
+        if memory_properties.memory_heaps[i as usize]
+            .flags
+            .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
+            && memory_properties.memory_heaps[i as usize].size > 1024 * 1024 * 1024
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Round `value` up to a multiple of `alignment`.
 fn align_up(value: vk::DeviceSize, alignment: vk::DeviceSize) -> vk::DeviceSize {
     if alignment == 0 {
@@ -317,13 +449,16 @@ fn align_up(value: vk::DeviceSize, alignment: vk::DeviceSize) -> vk::DeviceSize 
 struct VulkanBufferInner {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
-    /// Allocation size — used by the device-local readback path (increment 2).
-    #[allow(dead_code)]
+    /// Allocation size — used by the device-local readback copy.
     size: vk::DeviceSize,
-    /// Persistently mapped host pointer (host-visible buffers; this increment
-    /// allocates host-visible only).
+    /// Persistently mapped host pointer. For unified memory, the buffer's own
+    /// mapping; for device-local, the staging buffer's mapping.
     mapped: *mut c_void,
-    /// Clone of the logical device, used for destroy / unmap in drop.
+    /// Staging buffer for device-local memory (`None` if unified).
+    staging_buffer: Option<vk::Buffer>,
+    /// Staging buffer memory (`None` if unified).
+    staging_memory: Option<vk::DeviceMemory>,
+    /// Clone of the logical device, used for destroy in drop.
     device: ash::Device,
 }
 
@@ -332,11 +467,16 @@ unsafe impl Sync for VulkanBufferInner {}
 
 impl Drop for VulkanBufferInner {
     fn drop(&mut self) {
-        // Safety: the buffer owns its memory and mapping exclusively; the
-        // device handle is valid because buffers must not outlive the device
-        // (documented invariant).
+        // Safety: the buffer owns its resources exclusively; `free_memory`
+        // implicitly unmaps any mapped memory. The device handle is valid
+        // because buffers must not outlive the device (documented invariant).
         unsafe {
-            self.device.unmap_memory(self.memory);
+            if let Some(sb) = self.staging_buffer {
+                self.device.destroy_buffer(sb, None);
+            }
+            if let Some(sm) = self.staging_memory {
+                self.device.free_memory(sm, None);
+            }
             self.device.destroy_buffer(self.buffer, None);
             self.device.free_memory(self.memory, None);
         }
@@ -357,35 +497,42 @@ pub(super) fn drop_vulkan_buffer(raw: *mut c_void) {
 
 /// Vulkan implementation of [`Device`].
 ///
-/// Owns the Vulkan instance, physical device, logical device, queues, and
-/// memory properties. Buffers carry a device clone and self-destruct; the
-/// device itself is destroyed in [`Drop`].
+/// Owns the Vulkan instance, physical device, logical device, queues, transfer
+/// command pool, and memory properties. Buffers carry a device clone and
+/// self-destruct; the device itself is destroyed in [`Drop`].
 ///
 /// # Drop order
 ///
-/// `destroy_device` is called before `destroy_instance` (the Vulkan-mandated
-/// order) in the manual [`Drop`] impl.
+/// `destroy_command_pool` → `destroy_device` → `destroy_instance` (the
+/// Vulkan-mandated order) in the manual [`Drop`] impl.
 pub struct VulkanDevice {
     device: ash::Device,
     instance: ash::Instance,
     _entry: Entry,
-    /// Physical device — retained for future property queries and the
-    /// device-local readback path; read in tests.
+    /// Physical device — retained for future property queries; read in tests.
     #[allow(dead_code)]
     physical_device: vk::PhysicalDevice,
     queues: Queues,
+    /// Compute queue handle, used for staging transfers.
+    compute_queue: vk::Queue,
+    /// Transient command pool (on the compute family) for one-shot transfers.
+    command_pool: vk::CommandPool,
     memory_properties: vk::PhysicalDeviceMemoryProperties,
     memory_strategy: MemoryStrategy,
+    /// Effective memory placement: device-local (VRAM) vs host-visible.
+    uses_device_local: bool,
     limits: DeviceLimits,
     epoch: GpuEpochTracker,
 }
 
 impl Drop for VulkanDevice {
     fn drop(&mut self) {
-        // Safety: device before instance (Vulkan-mandated order). Buffers must
-        // already have been dropped by the caller (documented invariant).
+        // Safety: command pool before device before instance (Vulkan order).
+        // Buffers must already have been dropped by the caller (documented
+        // invariant) — they hold a cloned device handle.
         unsafe {
             self.device.device_wait_idle().ok();
+            self.device.destroy_command_pool(self.command_pool, None);
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
         }
@@ -428,8 +575,26 @@ impl VulkanDevice {
             min_storage_buffer_offset_alignment: props.limits.min_storage_buffer_offset_alignment,
         };
 
-        let (device, queues) =
+        let (device, queues, compute_queue) =
             unsafe { create_logical_device(&instance, physical_device, &choice) }?;
+
+        // Transient transfer command pool on the compute family (compute always
+        // supports transfer; dedicated transfer family is exposed to consumers
+        // but Zunesha's own staging uses the compute queue).
+        let pool_ci = vk::CommandPoolCreateInfo::default()
+            .flags(vk::CommandPoolCreateFlags::TRANSIENT)
+            .queue_family_index(choice.compute);
+        let command_pool = unsafe {
+            device
+                .create_command_pool(&pool_ci, None)
+                .map_err(|e| DeviceError::InitFailed(format!("vkCreateCommandPool: {e}")))?
+        };
+
+        let uses_device_local = match strategy {
+            MemoryStrategy::DeviceLocal => true,
+            MemoryStrategy::Unified => false,
+            MemoryStrategy::Auto => detect_device_local(props.device_type, &memory_properties),
+        };
 
         Ok(Self {
             device,
@@ -437,8 +602,11 @@ impl VulkanDevice {
             _entry: entry,
             physical_device,
             queues,
+            compute_queue,
+            command_pool,
             memory_properties,
             memory_strategy: strategy,
+            uses_device_local,
             limits,
             epoch: GpuEpochTracker::new(),
         })
@@ -486,27 +654,71 @@ impl Device for VulkanDevice {
         } else {
             align_up(byte_len, self.limits.min_storage_buffer_offset_alignment)
         };
+        let usage = Self::buffer_usage();
 
-        let (buffer, memory, mapped) = unsafe {
-            allocate_buffer(
-                &self.device,
-                &self.memory_properties,
-                aligned,
-                Self::buffer_usage(),
-            )?
-        };
-
-        if byte_len > 0 {
-            unsafe {
-                ptr::copy_nonoverlapping(data.as_ptr() as *const c_void, mapped, byte_len as usize);
+        let (buffer, memory, mapped, staging_buffer, staging_memory) = if self.uses_device_local {
+            // Device-local buffer + host-visible staging; copy data → staging,
+            // then staging → device.
+            let (dev_buf, dev_mem) = unsafe {
+                allocate_device_local_buffer(&self.device, &self.memory_properties, aligned, usage)?
+            };
+            let (stg_buf, stg_mem, stg_mapped) = unsafe {
+                allocate_buffer(
+                    &self.device,
+                    &self.memory_properties,
+                    aligned,
+                    vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
+                )?
+            };
+            if byte_len > 0 {
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        data.as_ptr() as *const c_void,
+                        stg_mapped,
+                        byte_len as usize,
+                    );
+                }
+                unsafe {
+                    one_shot_transfer(
+                        &self.device,
+                        self.command_pool,
+                        self.compute_queue,
+                        |cmd| {
+                            let copy = vk::BufferCopy::default().size(aligned);
+                            self.device.cmd_copy_buffer(
+                                cmd,
+                                stg_buf,
+                                dev_buf,
+                                std::slice::from_ref(&copy),
+                            );
+                        },
+                    )?;
+                }
             }
-        }
+            (dev_buf, dev_mem, stg_mapped, Some(stg_buf), Some(stg_mem))
+        } else {
+            // Unified memory: single host-visible buffer.
+            let (buf, mem, mapped) =
+                unsafe { allocate_buffer(&self.device, &self.memory_properties, aligned, usage)? };
+            if byte_len > 0 {
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        data.as_ptr() as *const c_void,
+                        mapped,
+                        byte_len as usize,
+                    );
+                }
+            }
+            (buf, mem, mapped, None, None)
+        };
 
         let inner = Box::new(VulkanBufferInner {
             buffer,
             memory,
             size: aligned,
             mapped,
+            staging_buffer,
+            staging_memory,
             device: self.device.clone(),
         });
         Ok(crate::Buffer {
@@ -523,14 +735,25 @@ impl Device for VulkanDevice {
         } else {
             align_up(byte_len, self.limits.min_storage_buffer_offset_alignment)
         };
+        let usage = Self::buffer_usage();
 
-        let (buffer, memory, mapped) = unsafe {
-            allocate_buffer(
-                &self.device,
-                &self.memory_properties,
-                aligned,
-                Self::buffer_usage(),
-            )?
+        let (buffer, memory, mapped, staging_buffer, staging_memory) = if self.uses_device_local {
+            let (dev_buf, dev_mem) = unsafe {
+                allocate_device_local_buffer(&self.device, &self.memory_properties, aligned, usage)?
+            };
+            let (stg_buf, stg_mem, stg_mapped) = unsafe {
+                allocate_buffer(
+                    &self.device,
+                    &self.memory_properties,
+                    aligned,
+                    vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
+                )?
+            };
+            (dev_buf, dev_mem, stg_mapped, Some(stg_buf), Some(stg_mem))
+        } else {
+            let (buf, mem, mapped) =
+                unsafe { allocate_buffer(&self.device, &self.memory_properties, aligned, usage)? };
+            (buf, mem, mapped, None, None)
         };
 
         let inner = Box::new(VulkanBufferInner {
@@ -538,6 +761,8 @@ impl Device for VulkanDevice {
             memory,
             size: aligned,
             mapped,
+            staging_buffer,
+            staging_memory,
             device: self.device.clone(),
         });
         Ok(crate::Buffer {
@@ -548,15 +773,29 @@ impl Device for VulkanDevice {
     }
 
     fn read_buffer<T: bytemuck::Pod>(&self, buffer: &crate::Buffer) -> Result<Vec<T>> {
-        // Safety: `raw` was produced by `Box::into_raw::<VulkanBufferInner>` in
-        // create_buffer[_uninit] and is still valid (buffer not dropped).
+        // Safety: `raw` was produced by `Box::into_raw::<VulkanBufferInner>` and
+        // is still valid (buffer not dropped).
         let inner = unsafe { &*(buffer.raw as *const VulkanBufferInner) };
 
-        // This increment allocates host-visible buffers only (mapped is always
-        // set). Device-local readback with staging lands in the next increment.
+        // Device-local buffers: copy device → staging, then read the staging
+        // mapping. Unified buffers: read the buffer's own mapping directly.
+        if let Some(stg_buf) = inner.staging_buffer {
+            unsafe {
+                one_shot_transfer(&self.device, self.command_pool, self.compute_queue, |cmd| {
+                    let copy = vk::BufferCopy::default().size(inner.size);
+                    self.device.cmd_copy_buffer(
+                        cmd,
+                        inner.buffer,
+                        stg_buf,
+                        std::slice::from_ref(&copy),
+                    );
+                })?;
+            }
+        }
+
         if inner.mapped.is_null() {
             return Err(DeviceError::BufferReadFailed {
-                message: "buffer is not host-visible".into(),
+                message: "buffer is not host-visible (no staging mapping)".into(),
             });
         }
 
@@ -595,9 +834,10 @@ mod tests {
                 return;
             }
         };
-        // compute is always Some (guaranteed by the contract); Queue carries a
-        // real family index.
-        assert!(device.queues().compute.family_index != u32::MAX);
+        assert!(
+            device.queues().compute.family_index != u32::MAX,
+            "compute family must be a real index"
+        );
         println!("compute family = {}", device.queues().compute.family_index);
     }
 
@@ -613,30 +853,25 @@ mod tests {
             }
         };
         let q = device.queues();
-        if let (Some(gfx_family), gfx) = (q.graphics.as_ref(), q.graphics) {
-            // If graphics exists and a dedicated compute family exists, they
-            // differ. (On unified hardware they share a family — that is also
-            // correct; this assertion only fires when both are Some AND distinct
-            // families exist on the device, which we detect by enumerating.)
-            let props = unsafe {
-                device
-                    .instance
-                    .get_physical_device_queue_family_properties(device.physical_device)
-            };
-            let has_dedicated_compute = props.iter().any(|f| {
-                f.queue_flags.contains(vk::QueueFlags::COMPUTE)
-                    && !f.queue_flags.contains(vk::QueueFlags::GRAPHICS)
-            });
+        let props = unsafe {
+            device
+                .instance
+                .get_physical_device_queue_family_properties(device.physical_device)
+        };
+        let has_dedicated_compute = props.iter().any(|f| {
+            f.queue_flags.contains(vk::QueueFlags::COMPUTE)
+                && !f.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+        });
+        if let Some(gfx) = q.graphics {
             if has_dedicated_compute {
                 assert_ne!(
-                    q.compute.family_index, gfx_family.family_index,
+                    q.compute.family_index, gfx.family_index,
                     "compute should use a dedicated family distinct from graphics"
                 );
-                let _ = gfx;
                 println!(
                     "async-compute verified: compute={} graphics={} transfer={:?}",
                     q.compute.family_index,
-                    gfx_family.family_index,
+                    gfx.family_index,
                     q.transfer.map(|t| t.family_index)
                 );
             } else {
@@ -645,10 +880,10 @@ mod tests {
         }
     }
 
-    /// Buffer roundtrip: create → read back, host-visible path.
+    /// Host-visible (unified) buffer roundtrip.
     #[test]
-    fn buffer_roundtrip() {
-        let device = match VulkanDevice::init() {
+    fn buffer_roundtrip_unified() {
+        let device = match VulkanDevice::init_with_strategy(MemoryStrategy::Unified) {
             Ok(d) => d,
             Err(e) => {
                 eprintln!("skipping: no Vulkan device ({e})");
@@ -659,6 +894,31 @@ mod tests {
         let buffer = device.create_buffer(&input).expect("create_buffer");
         let output: Vec<f32> = device.read_buffer(&buffer).expect("read_buffer");
         assert_eq!(output, input);
+    }
+
+    /// Device-local (VRAM) buffer roundtrip — exercises the staging path
+    /// (data → staging → device, then device → staging → read).
+    #[test]
+    fn buffer_roundtrip_device_local() {
+        let device = match VulkanDevice::init_with_strategy(MemoryStrategy::DeviceLocal) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Vulkan device ({e})");
+                return;
+            }
+        };
+        let input: Vec<u32> = (0..1000).collect();
+        let buffer = device
+            .create_buffer(&input)
+            .expect("create_buffer (device-local)");
+        let output: Vec<u32> = device
+            .read_buffer(&buffer)
+            .expect("read_buffer (device-local)");
+        assert_eq!(output, input);
+        println!(
+            "device-local roundtrip ok (placement={}, strategy={:?})",
+            device.uses_device_local, device.memory_strategy
+        );
     }
 
     /// A fresh device is quiescent (epoch counter at zero).
@@ -676,8 +936,8 @@ mod tests {
         assert!(device.prove_quiescent().is_some());
     }
 
-    /// `init_with(prefer_graphics)` must still succeed and expose graphics when
-    /// the host has a graphics-capable device.
+    /// `init_with(prefer_graphics)` exposes graphics when the host has a
+    /// graphics-capable device.
     #[test]
     fn prefer_graphics_exposes_graphics_when_available() {
         let device = match VulkanDevice::init_with(InitRequest::prefer_graphics()) {
