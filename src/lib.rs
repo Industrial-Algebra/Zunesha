@@ -58,7 +58,7 @@
 mod error;
 
 #[cfg(all(feature = "vulkan", not(target_os = "macos")))]
-mod vulkan;
+pub mod vulkan;
 
 /// GPU dispatch epoch tracking for GC safety.
 ///
@@ -149,14 +149,10 @@ impl InitRequest {
 /// by the device backend, so [`Queue`] is `Copy` and has no `Drop`.
 #[derive(Debug, Clone, Copy)]
 pub struct Queue {
-    /// Backend-specific raw queue handle.
-    // Read by the metal/vulkan backends when they land; write-only in the stub build.
-    #[allow(dead_code)]
-    pub(crate) raw: *mut c_void,
+    /// Backend-specific raw queue handle (e.g. a Vulkan `VkQueue`).
+    pub raw: *mut c_void,
     /// Queue family index the queue belongs to.
-    // Read by the metal/vulkan backends when they land; write-only in the stub build.
-    #[allow(dead_code)]
-    pub(crate) family_index: u32,
+    pub family_index: u32,
 }
 
 impl Queue {
