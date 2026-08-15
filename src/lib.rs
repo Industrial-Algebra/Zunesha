@@ -101,7 +101,7 @@ pub enum MemoryStrategy {
 /// requires a graphics queue (Borsalino-safe on compute-only hardware); this
 /// struct lets a caller *prefer* a graphics-capable device when one is needed
 /// (e.g. Goldenweek on a multi-GPU box with a compute GPU and a display GPU).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct InitRequest {
     /// Memory allocation strategy.
     pub memory: MemoryStrategy,
@@ -118,6 +118,15 @@ pub struct InitRequest {
     /// Zunesha still returns the best compute device and
     /// [`Queues::graphics`] is `None`. Goldenweek then refuses to initialise.
     pub prefer_graphics: bool,
+    /// Prefer a physical device whose name contains this substring
+    /// (case-insensitive), e.g. `Some("Intel".into())`.
+    ///
+    /// Useful on multi-GPU systems to pin work to a specific adapter (render
+    /// on the integrated GPU, compute on the discrete one) — and for tests
+    /// that need a particular driver's behaviour. A matched device still must
+    /// expose a compute queue; if no device matches, selection falls back to
+    /// the normal capability scoring (preference, not requirement).
+    pub device_hint: Option<String>,
 }
 
 impl InitRequest {
@@ -127,6 +136,7 @@ impl InitRequest {
         Self {
             memory: MemoryStrategy::Auto,
             prefer_graphics: false,
+            device_hint: None,
         }
     }
 
@@ -136,7 +146,17 @@ impl InitRequest {
         Self {
             memory: MemoryStrategy::Auto,
             prefer_graphics: true,
+            device_hint: None,
         }
+    }
+
+    /// Set a device-name hint (case-insensitive substring).
+    ///
+    /// Builder-style: `InitRequest::prefer_graphics().with_device_hint("Intel")`.
+    #[must_use]
+    pub fn with_device_hint(mut self, hint: impl Into<String>) -> Self {
+        self.device_hint = Some(hint.into());
+        self
     }
 }
 

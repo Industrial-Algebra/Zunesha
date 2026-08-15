@@ -114,12 +114,17 @@ fn device_type_score(dt: vk::PhysicalDeviceType) -> i32 {
 /// win over compute-only devices on multi-GPU systems — but if no device has
 /// graphics, the best compute device still wins (preference, not requirement).
 ///
+/// When `device_hint` is set, a device whose name contains the substring
+/// (case-insensitive) wins outright over scoring — a matched device still must
+/// expose a compute queue; no match falls back to scoring.
+///
 /// # Safety
 ///
 /// Vulkan FFI.
 unsafe fn pick_physical_device(
     instance: &ash::Instance,
     prefer_graphics: bool,
+    device_hint: Option<&str>,
 ) -> Result<(vk::PhysicalDevice, QueueFamilyChoice)> {
     let devices = unsafe {
         instance
@@ -129,6 +134,7 @@ unsafe fn pick_physical_device(
 
     let mut best_score: i32 = -1;
     let mut best: Option<(vk::PhysicalDevice, QueueFamilyChoice)> = None;
+    let mut hinted: Option<(vk::PhysicalDevice, QueueFamilyChoice)> = None;
 
     for &pd in &devices {
         let props = unsafe { instance.get_physical_device_properties(pd) };
@@ -137,8 +143,18 @@ unsafe fn pick_physical_device(
             continue;
         };
 
+        let has_graphics = choice.graphics.is_some();
+        if let Some(hint) = device_hint {
+            // Safety: `device_name` is a NUL-terminated array populated by the
+            // driver.
+            let name = unsafe { CStr::from_ptr(props.device_name.as_ptr()) }.to_string_lossy();
+            if name.to_lowercase().contains(&hint.to_lowercase()) && hinted.is_none() {
+                hinted = Some((pd, choice));
+                continue;
+            }
+        }
         let mut score = device_type_score(props.device_type);
-        if prefer_graphics && choice.graphics.is_some() {
+        if prefer_graphics && has_graphics {
             score += 100;
         }
         if score > best_score {
@@ -147,7 +163,8 @@ unsafe fn pick_physical_device(
         }
     }
 
-    best.ok_or_else(|| {
+    let chosen = hinted.or(best);
+    chosen.ok_or_else(|| {
         DeviceError::InitFailed("no Vulkan device with a compute queue found".into())
     })
 }
@@ -605,8 +622,8 @@ impl Drop for VulkanDevice {
 }
 
 impl VulkanDevice {
-    /// Build a device with an explicit memory strategy and graphics preference.
-    fn build(strategy: MemoryStrategy, prefer_graphics: bool) -> Result<Self> {
+    /// Build a device from a full [`InitRequest`].
+    fn build(request: InitRequest) -> Result<Self> {
         let entry = unsafe { Entry::load().map_err(|e| DeviceError::InitFailed(format!("{e}")))? };
 
         // Query the available instance version before requesting one. Requesting
@@ -626,7 +643,7 @@ impl VulkanDevice {
         // instance extension so the caller can create whichever surface it needs
         // (platform or headless). Unsupported extensions are skipped, so a
         // compute-only loader never fails here.
-        let instance_extensions: Vec<*const c_char> = if prefer_graphics {
+        let instance_extensions: Vec<*const c_char> = if request.prefer_graphics {
             let available = available_instance_extensions(&entry);
             INSTANCE_SURFACE_EXTENSIONS
                 .iter()
@@ -646,8 +663,13 @@ impl VulkanDevice {
                 .map_err(|e| DeviceError::InitFailed(format!("vkCreateInstance: {e}")))?
         };
 
-        let (physical_device, choice) =
-            unsafe { pick_physical_device(&instance, prefer_graphics) }?;
+        let (physical_device, choice) = unsafe {
+            pick_physical_device(
+                &instance,
+                request.prefer_graphics,
+                request.device_hint.as_deref(),
+            )
+        }?;
 
         let props = unsafe { instance.get_physical_device_properties(physical_device) };
         let memory_properties =
@@ -658,7 +680,7 @@ impl VulkanDevice {
 
         // Enable the swapchain device extension when graphics is requested and
         // the chosen physical device supports it (compute-only HW will not).
-        let device_extensions: Vec<*const c_char> = if prefer_graphics {
+        let device_extensions: Vec<*const c_char> = if request.prefer_graphics {
             let available = unsafe { available_device_extensions(&instance, physical_device) };
             if available.contains(SWAPCHAIN_EXTENSION) {
                 vec![SWAPCHAIN_EXTENSION.as_ptr()]
@@ -685,7 +707,7 @@ impl VulkanDevice {
                 .map_err(|e| DeviceError::InitFailed(format!("vkCreateCommandPool: {e}")))?
         };
 
-        let uses_device_local = match strategy {
+        let uses_device_local = match request.memory {
             MemoryStrategy::DeviceLocal => true,
             MemoryStrategy::Unified => false,
             MemoryStrategy::Auto => detect_device_local(props.device_type, &memory_properties),
@@ -700,7 +722,7 @@ impl VulkanDevice {
             compute_queue,
             command_pool,
             memory_properties,
-            memory_strategy: strategy,
+            memory_strategy: request.memory,
             uses_device_local,
             limits,
             epoch: GpuEpochTracker::new(),
@@ -714,6 +736,16 @@ impl VulkanDevice {
             | vk::BufferUsageFlags::VERTEX_BUFFER
             | vk::BufferUsageFlags::TRANSFER_SRC
             | vk::BufferUsageFlags::TRANSFER_DST
+    }
+
+    /// The Vulkan entry (loader handle) this device was created from.
+    ///
+    /// Exposed so graphics consumers can load instance-extension function
+    /// tables (e.g. `VK_KHR_surface`, `VK_EXT_headless_surface`) against the
+    /// shared instance.
+    #[must_use]
+    pub fn entry(&self) -> &Entry {
+        &self._entry
     }
 
     /// Raw Vulkan instance handle.
@@ -750,15 +782,19 @@ impl VulkanDevice {
 
 impl Device for VulkanDevice {
     fn init() -> Result<Self> {
-        Self::build(MemoryStrategy::Auto, false)
+        Self::build(InitRequest::compute_only())
     }
 
     fn init_with_strategy(strategy: MemoryStrategy) -> Result<Self> {
-        Self::build(strategy, false)
+        Self::build(InitRequest {
+            memory: strategy,
+            prefer_graphics: false,
+            device_hint: None,
+        })
     }
 
     fn init_with(request: InitRequest) -> Result<Self> {
-        Self::build(request.memory, request.prefer_graphics)
+        Self::build(request)
     }
 
     fn queues(&self) -> Queues {
