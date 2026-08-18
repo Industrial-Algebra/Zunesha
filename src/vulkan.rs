@@ -778,6 +778,18 @@ impl VulkanDevice {
     pub fn memory_properties(&self) -> vk::PhysicalDeviceMemoryProperties {
         self.memory_properties
     }
+
+    /// Raw `VkBuffer` handle for a buffer created by this device.
+    ///
+    /// Exposed so graphics consumers (Goldenweek) can bind Zunesha buffers as
+    /// vertex buffers — the zero-copy compute→render interop path (ADR 0001).
+    /// The handle is valid while the buffer lives.
+    #[must_use]
+    pub fn raw_buffer(&self, buffer: &crate::Buffer) -> vk::Buffer {
+        // Safety: `raw` was produced by `Box::into_raw::<VulkanBufferInner>` in
+        // `create_buffer` and remains valid while `buffer` is alive.
+        unsafe { (*(buffer.raw as *const VulkanBufferInner)).buffer }
+    }
 }
 
 impl Device for VulkanDevice {
