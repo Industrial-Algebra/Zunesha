@@ -39,10 +39,10 @@
 //!
 //! ## Backends
 //!
-//! | Feature  | Platform       | Status (v0.1)        |
-//! |----------|----------------|----------------------|
-//! | `metal`  | macOS          | 🚧 Trait + stub only |
-//! | `vulkan` | Linux, Windows | 🚧 Trait + stub only |
+//! | Feature  | Platform       | Status (v0.1)                                    |
+//! |----------|----------------|--------------------------------------------------|
+//! | `metal`  | macOS          | 🚧 Trait + stub only                             |
+//! | `vulkan` | Linux, Windows | ✅ Device, queues, host-visible + device-local   |
 //!
 //! v0.1 ships the [`Device`] trait, the [`Buffer`] / queue / quiescence types,
 //! the ported [`epoch`] tracker, and a [`NoDeviceStub`]. The Vulkan backend is
@@ -90,6 +90,24 @@ pub enum MemoryStrategy {
     Unified,
     /// Force device-local memory with staging transfers (discrete GPUs).
     /// Best for NVIDIA RTX, AMD RDNA, Intel Arc.
+    DeviceLocal,
+}
+
+/// Where a device's buffers actually live.
+///
+/// [`MemoryStrategy`] is the *request*; this is the *resolution*.
+/// [`MemoryStrategy::Auto`] picks a concrete placement at device
+/// initialisation, and [`Device::buffer_placement`] reports which one — so consumers and tests can observe where the bytes
+/// landed instead of re-deriving the hardware heuristic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryPlacement {
+    /// Host-visible, directly CPU-mappable memory — the
+    /// [`MemoryStrategy::Unified`] request, or `Auto` on integrated/unified
+    /// hardware.
+    HostVisible,
+    /// Dedicated device-local memory reached through staging transfers — the
+    /// [`MemoryStrategy::DeviceLocal`] request, or `Auto` on discrete-class
+    /// hardware (see the `detect_device_local` heuristic in the backend).
     DeviceLocal,
 }
 
@@ -370,6 +388,13 @@ pub trait Device: Sized {
     /// The memory strategy this device was initialised with.
     fn memory_strategy(&self) -> MemoryStrategy;
 
+    /// The *effective* placement of buffers this device allocates.
+    ///
+    /// Differs from [`memory_strategy`](Self::memory_strategy) exactly when
+    /// the strategy is [`MemoryStrategy::Auto`]: this reports what `Auto`
+    /// resolved to on this hardware, not the request.
+    fn buffer_placement(&self) -> MemoryPlacement;
+
     /// Allocate a buffer and upload initial data.
     fn create_buffer<T: bytemuck::Pod>(&self, data: &[T]) -> Result<Buffer>;
 
@@ -463,6 +488,12 @@ impl Device for NoDeviceStub {
     fn memory_strategy(&self) -> MemoryStrategy {
         MemoryStrategy::Auto
     }
+
+    fn buffer_placement(&self) -> MemoryPlacement {
+        // The stub never allocates; HostVisible is the documented default so
+        // the enum is total for every Device implementation.
+        MemoryPlacement::HostVisible
+    }
     fn create_buffer<T: bytemuck::Pod>(&self, _data: &[T]) -> Result<Buffer> {
         Err(DeviceError::NoDevice)
     }
@@ -547,6 +578,16 @@ mod tests {
         assert_eq!(q.compute.family_index, u32::MAX);
         assert!(q.graphics.is_none());
         assert!(!q.has_graphics());
+    }
+
+    #[test]
+    fn stub_placement_is_host_visible() {
+        // The stub never allocates; HostVisible is its documented default so
+        // the enum is total for every Device implementation.
+        assert_eq!(
+            NoDeviceStub.buffer_placement(),
+            MemoryPlacement::HostVisible
+        );
     }
 
     #[test]

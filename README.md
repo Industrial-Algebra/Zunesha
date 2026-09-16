@@ -142,6 +142,22 @@ obligation bundles) stays in Borsalino. Cross-crate proof agreement (IA P3) —
 where Borsalino/Goldenweek per-kernel bundles cite Zunesha's device/buffer
 obligations by origin — is governed by an ADR.
 
+## Testing
+
+GPU tests run against the host's Vulkan ICDs and skip with a message when
+no device (or loader) is present — e.g. on CI runners.
+
+Pin a device for reproducibility with `ZUNESHA_TEST_DEVICE` (a
+case-insensitive device-name substring, the same convention as Goldenweek's
+`GOLDENWEEK_TEST_DEVICE`):
+
+```sh
+ZUNESHA_TEST_DEVICE=intel cargo test --features vulkan
+```
+
+GPU tests are serialized with `serial_test` — the Vulkan loader is not safe
+under parallel instance creation.
+
 ## License
 
 Apache-2.0. Copyright (C) 2026 Industrial Algebra.

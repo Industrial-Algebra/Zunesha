@@ -40,6 +40,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `entry`, and `raw_buffer(&Buffer)` — the zero-copy compute→render interop
   seam Goldenweek's renderer consumes.
 
+### Added — Placement Observability
+- **`MemoryPlacement`** (`HostVisible` / `DeviceLocal`) and
+  `Device::buffer_placement()` — the *effective* placement of a device's
+  buffers, distinct from the requested `MemoryStrategy`. `Auto` resolves at
+  init; this reports the resolution so consumers and tests no longer have to
+  re-derive the hardware heuristic (per RABBIT_HOLE_2026-09-02).
+- **`ZUNESHA_TEST_DEVICE`** test-pinning convention, mirroring Goldenweek's
+  `GOLDENWEEK_TEST_DEVICE`.
+
 ### Added — Vulkan Backend (`vulkan` feature)
 - Full device/queue/memory/buffer implementation via `ash`: policy-A queue
   resolution, host-visible and device-local buffer paths (verified on
