@@ -1,5 +1,6 @@
 # Zunesha
 
+[![CI](https://github.com/Industrial-Algebra/Zunesha/actions/workflows/ci.yml/badge.svg)](https://github.com/Industrial-Algebra/Zunesha/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](./LICENSE)
 
 Shared GPU **device substrate** for the Industrial Algebra ecosystem.
