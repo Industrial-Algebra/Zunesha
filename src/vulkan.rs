@@ -7,7 +7,7 @@
 //! from Borsalino's `vulkan.rs` device/memory/buffer layer, with two
 //! Zunesha-specific changes:
 //!
-//! - **Capability-driven queue selection.** [`select_queue_families`] prefers a
+//! - **Capability-driven queue selection.** `select_queue_families` prefers a
 //!   dedicated `COMPUTE`-without-`GRAPHICS` family for `compute` (async-compute
 //!   isolation), with a graceful fallback to the first compute-capable family on
 //!   unified hardware. `graphics` and `transfer` are `Option`, present only
