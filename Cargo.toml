@@ -11,9 +11,9 @@ categories = ["hardware-support"]
 
 [features]
 default = []
-# Device backends land post-v0.1. v0.1 ships the `Device` trait, opaque-handle
-# surface, ported epoch tracker, and a NoDevice stub — mirroring the
-# pre-backend state of Borsalino/Goldenweek.
+# v0.1 ships the `Device` trait, the opaque-handle surface, the ported epoch
+# tracker, a NoDevice stub, and the complete Vulkan backend. Metal lands
+# post-v0.1 (substrate-first: Zunesha-Metal precedes Goldenweek-Metal).
 metal = []
 vulkan = ["dep:ash"]
 # karpal-verify obligation bundles for device/buffer-lifecycle properties
@@ -39,6 +39,15 @@ ash = { version = "0.38", optional = true }
 # parallel with a plain one). `#[serial]` keeps the vulkan tests from racing
 # the loader.
 serial_test = "3"
+
+[[example]]
+name = "device-info"
+required-features = ["vulkan"]
+
+[[example]]
+name = "buffer-roundtrip"
+required-features = ["vulkan"]
+# (quiescence runs on default features — pure CPU, CI-safe)
 
 # Still pending:
 #   metal  (macOS)         -> objc = "0.2"            (raw objc_msgSend FFI)
