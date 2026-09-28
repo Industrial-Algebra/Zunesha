@@ -1,5 +1,7 @@
 # Zunesha
 
+[![crates.io](https://img.shields.io/crates/v/zunesha)](https://crates.io/crates/zunesha)
+[![docs.rs](https://img.shields.io/docsrs/zunesha)](https://docs.rs/zunesha)
 [![CI](https://github.com/Industrial-Algebra/Zunesha/actions/workflows/ci.yml/badge.svg)](https://github.com/Industrial-Algebra/Zunesha/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](./LICENSE)
 
@@ -9,6 +11,7 @@ Shared GPU **device substrate** for the Industrial Algebra ecosystem.
 
 ## Documentation
 
+- **API reference** — [docs.rs/zunesha](https://docs.rs/zunesha)
 - **[docs/architecture.md](docs/architecture.md)** — purpose, the three-tensions assessment, and position in the stack.
 - **Decision records** in [docs/adr/](docs/adr/):
   - [0001 — Shared device substrate](docs/adr/0001-shared-device-substrate.md)
@@ -157,6 +160,16 @@ ZUNESHA_TEST_DEVICE=intel cargo test --features vulkan
 
 GPU tests are serialized with `serial_test` — the Vulkan loader is not safe
 under parallel instance creation.
+
+## Examples
+
+Runnable API tours (`examples/`):
+
+```sh
+cargo run --example quiescence                        # epoch tracker + proof (no GPU needed)
+cargo run --features vulkan --example device-info     # queue shape + placement on this host
+cargo run --features vulkan --example buffer-roundtrip  # both memory strategies, verified
+```
 
 ## License
 

@@ -110,6 +110,24 @@ impl GpuEpochTracker {
     pub fn is_quiescent(&self) -> bool {
         self.in_flight() == 0
     }
+
+    /// Construct a [`QuiescenceProof`](crate::QuiescenceProof) if the
+    /// tracker is currently idle.
+    ///
+    /// The proof is a phantom — obtainable only through this method, and
+    /// this method returns `Some` only at zero in-flight dispatches.
+    /// Host runtimes hand it to compaction code that takes the proof as a
+    /// parameter, so unverified compaction does not compile.
+    /// [`Device::prove_quiescent`](crate::Device::prove_quiescent) delegates
+    /// here.
+    #[must_use]
+    pub fn prove_quiescent(&self) -> Option<crate::QuiescenceProof> {
+        if self.is_quiescent() {
+            Some(crate::QuiescenceProof { _private: () })
+        } else {
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -121,6 +139,22 @@ mod tests {
         let tracker = GpuEpochTracker::new();
         assert_eq!(tracker.in_flight(), 0);
         assert!(tracker.is_quiescent());
+    }
+
+    #[test]
+    fn proof_exists_only_at_zero_in_flight() {
+        let tracker = GpuEpochTracker::new();
+        assert!(
+            tracker.prove_quiescent().is_some(),
+            "fresh tracker yields a proof"
+        );
+        tracker.begin_dispatch();
+        assert!(
+            tracker.prove_quiescent().is_none(),
+            "no proof while in flight"
+        );
+        tracker.end_dispatch();
+        assert!(tracker.prove_quiescent().is_some(), "proof returns at zero");
     }
 
     #[test]

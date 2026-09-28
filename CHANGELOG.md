@@ -49,6 +49,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`ZUNESHA_TEST_DEVICE`** test-pinning convention, mirroring Goldenweek's
   `GOLDENWEEK_TEST_DEVICE`.
 
+### Added — Release Polish (v0.1.0)
+- **Examples** (`examples/`): `quiescence` (epoch tracker + proof — pure
+  CPU, CI-safe), `device-info` and `buffer-roundtrip` (vulkan-gated,
+  skip gracefully without a device).
+- **`release.yml`** — tag-triggered crates.io publish (version-verified) +
+  GitHub Release with changelog-extracted notes.
+- **README** — crates.io/docs.rs badges, Examples section, docs.rs link.
+- **`docs/ROADMAP.md`** + **`docs/critique.md`** — v0.1.0 snapshot (honest
+  weaknesses: tracker vacuity, unowned cross-queue time, single consumer,
+  `verify` unproven, single backend).
+
 ### Added — Vulkan Backend (`vulkan` feature)
 - Full device/queue/memory/buffer implementation via `ash`: policy-A queue
   resolution, host-visible and device-local buffer paths (verified on
