@@ -23,26 +23,35 @@ it was extracted *for* (Borsalino) — only by the crate born beside it.
    ("strictly stronger at the chokepoint") is architecturally right and
    operationally unproven.
 
-2. **Time is unowned.** Buffers are `SHARING_MODE::EXCLUSIVE` while the
+2. **`QuiescenceProof` certifies a past instant, not a held state.** Between
+   obtaining the proof and acting on it, another thread may begin a
+   dispatch — a time-of-check/time-of-use window `SeqCst` ordering cannot
+   close. The proof makes *unverified* compaction a compile error (real
+   value); it does not make *racy* compaction impossible. Sound today
+   because consumers are single-threaded; multi-threaded consumers must
+   hold a lock the dispatch path also takes. (Found by the 2026-09-29
+   Borsalino research dive; documented on the type since.)
+
+3. **Time is unowned.** Buffers are `SHARING_MODE::EXCLUSIVE` while the
    queue model deliberately splits compute and graphics across families.
    Nothing performs release/acquire ownership transfers; correctness rests
    entirely on host-synchronous discipline (`queue_wait_idle` everywhere,
    blocking present). This is sound today and silently wrong the day
    dispatch goes async. See ROADMAP's ADR-0004 candidate.
 
-3. **One live consumer.** Goldenweek's integration validated the trait
+4. **One live consumer.** Goldenweek's integration validated the trait
    shape (zero post-hoc API churn through five increments — the best
    available evidence it is right), but a single consumer is a sample of
    one. Borsalino, the harder migration (it has habits to unlearn), has not
    started.
 
-4. **`verify` is a promise.** ADR 0003 assigns Zunesha structural
+5. **`verify` is a promise.** ADR 0003 assigns Zunesha structural
    device/buffer proof obligations; the feature exists and the phantom
    `QuiescenceProof` is well-shaped, but no karpal-verify obligation
    consumes any of it. The crate's differentiation claim is currently
    architectural, not demonstrated.
 
-5. **Single backend.** Linux/Windows only. macOS consumers (`MemoryStrategy::Unified`'s natural constituency — Apple Silicon, GB10) have no path.
+6. **Single backend.** Linux/Windows only. macOS consumers (`MemoryStrategy::Unified`'s natural constituency — Apple Silicon, GB10) have no path.
 
 ## What went right
 

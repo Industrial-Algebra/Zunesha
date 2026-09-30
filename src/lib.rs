@@ -332,14 +332,24 @@ impl<'a> Default for BufferPinHandle<'a> {
     }
 }
 
-/// Compile-time proof that no GPU operations are outstanding.
+/// Proof that no GPU operations were outstanding at a past instant.
 ///
 /// Required by GC-sensitive contexts. Constructed via
 /// [`Device::prove_quiescent`] when [`Device::is_quiescent`] returns true.
 ///
-/// This proof certifies that the epoch counter was zero at construction time —
-/// no dispatches were in-flight. Combined with [`GpuEpochTracker`], this
-/// ensures GC compaction is safe.
+/// # What this certifies — and what it does not
+///
+/// The proof certifies a **past** state: the epoch counter was zero at
+/// construction time. Between obtaining the proof and acting on it (e.g.
+/// calling `dispatch_verified_gc`), another thread may have begun a
+/// dispatch; `SeqCst` ordering does not close that race. The proof is a
+/// capability token — it makes unverified compaction a compile error —
+/// not a guarantee that quiescence *holds* at the moment of use.
+///
+/// Closing the window is the consumer's discipline: a single dispatcher
+/// thread, or holding a lock that the dispatch path also takes, makes the
+/// proof sound. (Found by the 2026-09-29 Borsalino research dive; same
+/// caveat applies to Borsalino's `QuiescenceProof`.)
 #[derive(Clone, Copy, Debug)]
 pub struct QuiescenceProof {
     _private: (),
@@ -454,6 +464,10 @@ pub trait Device: Sized {
     }
 
     /// Construct a [`QuiescenceProof`] if the device is currently idle.
+    ///
+    /// Certifies a **past** instant — see [`QuiescenceProof`] for the
+    /// time-of-check/time-of-use window and the consumer discipline that
+    /// closes it.
     fn prove_quiescent(&self) -> Option<QuiescenceProof> {
         if self.is_quiescent() {
             Some(QuiescenceProof { _private: () })

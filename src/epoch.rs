@@ -118,8 +118,15 @@ impl GpuEpochTracker {
     /// this method returns `Some` only at zero in-flight dispatches.
     /// Host runtimes hand it to compaction code that takes the proof as a
     /// parameter, so unverified compaction does not compile.
-    /// [`Device::prove_quiescent`](crate::Device::prove_quiescent) delegates
-    /// here.
+    /// [`Device::prove_quiescent`](crate::Device::prove_quiescent) mirrors
+    /// this at the device layer.
+    ///
+    /// # Time-of-check caveat
+    ///
+    /// The proof certifies a **past** instant (the counter was zero at call
+    /// time). Another thread may begin a dispatch between this call and the
+    /// proof's use; ordering does not close that window. Single-dispatcher
+    /// discipline or a shared lock does. See `QuiescenceProof` docs.
     #[must_use]
     pub fn prove_quiescent(&self) -> Option<crate::QuiescenceProof> {
         if self.is_quiescent() {

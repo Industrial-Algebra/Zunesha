@@ -59,6 +59,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`docs/ROADMAP.md`** + **`docs/critique.md`** — v0.1.0 snapshot (honest
   weaknesses: tracker vacuity, unowned cross-queue time, single consumer,
   `verify` unproven, single backend).
+- **Quiescence-proof TOCTOU honesty** — `QuiescenceProof` docs now state
+  the proof certifies a **past** instant (time-of-check/time-of-use window
+  between proof and use; consumer discipline closes it). Found by the
+  2026-09-29 Borsalino research dive; documented on the type, the tracker
+  method, and in the critique before first publish.
 
 ### Added — Vulkan Backend (`vulkan` feature)
 - Full device/queue/memory/buffer implementation via `ash`: policy-A queue
