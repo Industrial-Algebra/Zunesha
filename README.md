@@ -3,6 +3,7 @@
 [![crates.io](https://img.shields.io/crates/v/zunesha)](https://crates.io/crates/zunesha)
 [![docs.rs](https://img.shields.io/docsrs/zunesha)](https://docs.rs/zunesha)
 [![CI](https://github.com/Industrial-Algebra/Zunesha/actions/workflows/ci.yml/badge.svg)](https://github.com/Industrial-Algebra/Zunesha/actions/workflows/ci.yml)
+[![Docs](https://img.shields.io/badge/docs-book-blue)](https://zunesha.industrial-algebra.com)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](./LICENSE)
 
 Shared GPU **device substrate** for the Industrial Algebra ecosystem.
