@@ -27,8 +27,10 @@ if device.queues().has_graphics() {
 // Buffers are the shared primitive — compute writes, graphics reads.
 let buf = device.create_buffer(&[1.0f32, 2.0, 3.0, 4.0])?;
 
-// GC safety: one quiescence query certifies NO GPU work (compute or
-// graphics) is touching host memory before a moving GC compacts.
+// GC safety protocol: once consumers wire dispatch accounting into the
+// device tracker, one quiescence query certifies no GPU work touches host
+// memory. v0.1 caveat: no production path increments the tracker yet —
+// see Concepts → Epoch Tracking before relying on this.
 if device.is_quiescent() {
     gc_compact();
 }

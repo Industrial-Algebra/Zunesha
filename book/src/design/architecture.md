@@ -90,7 +90,7 @@ both compute and graphics traffic rather than only compute.
 
 ## API surface
 
-The [`Device`](../src/lib.rs) trait is the contract. Its essentials:
+The [`Device`](https://docs.rs/zunesha) trait is the contract. Its essentials:
 
 - **Construction** — `init()`, `init_with_strategy(MemoryStrategy)`,
   `init_with(InitRequest)`. `init()` is Borsalino-safe: it never requires a

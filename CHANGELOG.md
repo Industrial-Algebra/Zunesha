@@ -5,6 +5,21 @@ All notable changes to Zunesha are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+### Fixed — review findings (2026-10-01)
+
+- Book no longer recommends GC compaction on the device counter: the
+  epoch chapter, introduction, and quick start now carry the v0.1
+  accounting status (no production dispatch path increments the
+  tracker yet) and describe the intended guarantee separately.
+- ADRs included as chapters in SUMMARY.md — the Decision Records
+  index/queue/architecture links now render to real pages; the
+  architecture page's `../src/lib.rs` link replaced with docs.rs.
+- Backends table corrected: **Vulkan ships in v0.1** (book and README);
+  Metal remains post-v0.1. Ecosystem tables now frame consumer
+  migrations (Borsalino/Goldenweek/Baedeker) as planned, not shipped.
+- Rendered local-link check added to the verification pass (zero
+  missing targets).
+
 ### Added
 - mdBook documentation (IA Navy theme) — `book/` with Introduction,
   Getting Started, Concepts (device substrate, capability queues, epoch

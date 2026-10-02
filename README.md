@@ -114,11 +114,11 @@ if device.is_quiescent() {
 | Backend | Platform | Feature | Status |
 |---|---|---|---|
 | Metal | macOS (Apple Silicon) | `metal` | 🚧 post-v0.1 — raw `objc_msgSend` FFI |
-| Vulkan | Linux, Windows | `vulkan` | 🚧 post-v0.1 — raw `ash` FFI |
+| Vulkan | Linux, Windows | `vulkan` | ✅ ships in v0.1 — raw `ash` FFI |
 | Stub | Any | (none) | ✅ `NoDeviceStub` — safe fallback |
 
 v0.1 ships the [`Device`] trait, the buffer/queue/quiescence types, the ported
-epoch tracker, and a `NoDeviceStub`. Both backends hand-roll their FFI (no
+epoch tracker, the complete Vulkan backend, and a `NoDeviceStub`. Both backends hand-roll their FFI (no
 `wgpu`) to match Borsalino/Goldenweek's auditability.
 
 ## Design refusals (v0.1)

@@ -1,17 +1,32 @@
 # Epoch Tracking & Quiescence
 
-The epoch tracker (ported from Borsalino, strengthened) observes **every**
-dispatch made through the device — compute and graphics alike. A single
-quiescence query then certifies that no GPU work is touching host memory:
+## Current status: the tracker is wired, the dispatches are not
+
+`is_quiescent()` / `prove_quiescent()` read a `GpuEpochTracker` embedded in
+the device — and as of v0.1, **no production path increments it yet**:
+`begin_dispatch`/`end_dispatch` are called only by tests. Until consumers
+wire their fence-completion callbacks into the device's tracker,
+`prove_quiescent()` proves only that *nothing has been counted*, which is not
+evidence of GPU quiescence. This is the first entry in the
+[critique](./../design/critique.md), and the intended guarantee below is
+what the migration will deliver — do **not** compact host memory today on
+the strength of the device counter alone.
+
+## The intended guarantee
+
+Once consumers report dispatches through the device's tracker (the planned
+Borsalino migration wires fence completion into it), one quiescence query
+certifies that no GPU work is touching host memory:
 
 ```rust
-if device.is_quiescent() {
-    // Safe for a moving GC to compact host memory.
+match device.prove_quiescent() {
+    Some(_proof) => { /* all counted dispatches observed complete */ }
+    None => { /* in-flight work: not now */ }
 }
 ```
 
-This is strictly stronger than the per-library tracking it replaced: one
-tracker, both faces of the device, no cross-library accounting.
+That is strictly stronger than per-library tracking: one tracker, both faces
+of the device, no cross-library accounting.
 
 ## The proof certifies a past instant
 

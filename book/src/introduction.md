@@ -18,9 +18,11 @@ stay in the consumer libraries; Zunesha is the substrate they stand on.
   (NVIDIA GB10, headless datacenter GPUs) is a first-class citizen.
 - **Shared buffers** — a buffer allocated for compute *is* the memory a render
   pipeline binds. Zero-copy compute→render interop by construction.
-- **Unified GC safety** — the epoch tracker observes *every* dispatch through
-  the device, compute and graphics alike; one quiescence query certifies no GPU
-  work touches host memory before a moving GC compacts.
+- **Unified GC safety (protocol shipped, consumer wiring pending)** — the
+  epoch tracker and quiescence-proof types are the device's contract, but as
+  of v0.1 no production dispatch path increments the tracker yet; see
+  [Epoch Tracking & Quiescence](./concepts/epoch.md) for the exact current
+  status.
 - **Surface-agnostic** — no windowing, no presentation, no shader compilation.
 
 ## Why It Exists
