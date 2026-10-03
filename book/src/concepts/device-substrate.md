@@ -25,19 +25,20 @@ should own it.
 
 | Project | Relationship |
 |---|---|
-| **Borsalino** | Intended compute consumer (migration planned, not yet landed). Will hold a `zunesha::Device` and dispatch compute on `queues().compute`; today it still owns its device internally. |
-| **Goldenweek** | Intended graphics consumer (migration planned). Will require `queues().has_graphics()` and render against the surface. |
+| **Goldenweek** | **Live graphics consumer** — depends on Zunesha (`vulkan` feature), borrows a `zunesha::VulkanDevice`, and allocates/wraps `zunesha::Buffer`s. |
+| **Borsalino** | Intended compute consumer — migration planned, not yet landed; Borsalino still owns its device internally. |
 | **Baedeker** | WASM host (planned). Creates one Zunesha device, hands it to both the compute and graphics host modules. |
 | **Miriami** | Trans-graphical framework (future). Lowers its geometric projection onto Goldenweek, which sits on Zunesha. |
 
-Until the consumer migrations land, Zunesha's consumers are examples and
-tests; the ecosystem diagram above is the *target* architecture. The zero-copy
-compute→render interop story becomes real when Borsalino and Goldenweek both
-stand on the same device — that work is on the roadmap, not in this release.
+Goldenweek's integration is implemented today; Borsalino's is the pending
+migration. The zero-copy compute→render interop story — compute output bound
+directly as render input on one shared device — becomes real when **Borsalino**
+also stands on Zunesha: Goldenweek's half of the seam already exists.
 
 ## Buffer ownership
 
-`zunesha::Buffer` is the shared primitive. `Borsalino::GpuBuffer` and
-`Goldenweek::GpuBuffer` both wrap it — a buffer allocated for compute *is* the
-memory a render pipeline binds. No staging copies, no format negotiation
-between siblings.
+`zunesha::Buffer` is the shared primitive. **Goldenweek wraps it today** —
+its buffers are `zunesha::Buffer`s allocated through the borrowed device.
+Borsalino's `GpuBuffer` does **not** yet (pending migration): once it does,
+a buffer allocated for compute *is* the memory a render pipeline binds —
+no staging copies, no format negotiation between siblings.

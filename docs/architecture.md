@@ -80,17 +80,20 @@ Zunesha does **not** try to prove everything. Per
 
 | Crate | Proves |
 |---|---|
-| **Zunesha** | Structural device & buffer safety — buffers don't outlive the device, the epoch/GC tracker sees *all* work, queues match the hardware's capabilities |
+| **Zunesha** | Structural device & buffer safety — buffers don't outlive the device, the epoch/GC tracker is *positioned* to see all work (v0.1: consumer dispatch accounting not yet wired — see critique #1), queues match the hardware's capabilities |
 | **Borsalino** | Numerical exactness of compute results |
 | **Goldenweek** | Structural correctness of graphics state — pipelines are valid, frames are acquired-before-drawn-before-presented |
 
-A notable consequence: moving the epoch tracker into Zunesha makes it
-**strictly stronger** than it was in Borsalino, because one tracker now observes
-both compute and graphics traffic rather than only compute.
+A notable consequence: moving the epoch tracker into Zunesha is
+**designed to be strictly stronger** than it was in Borsalino, because one
+tracker would observe both compute and graphics traffic rather than only
+compute. This is the target guarantee; as of v0.1 no production dispatch
+path increments the device tracker yet (critique weakness #1), so the
+strength is architectural, not yet operational.
 
 ## API surface
 
-The [`Device`](../src/lib.rs) trait is the contract. Its essentials:
+The [`Device`](https://docs.rs/zunesha) trait is the contract. Its essentials:
 
 - **Construction** — `init()`, `init_with_strategy(MemoryStrategy)`,
   `init_with(InitRequest)`. `init()` is Borsalino-safe: it never requires a

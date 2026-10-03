@@ -27,13 +27,16 @@ if device.queues().has_graphics() {
 // Buffers are the shared primitive — compute writes, graphics reads.
 let buf = device.create_buffer(&[1.0f32, 2.0, 3.0, 4.0])?;
 
-// GC safety protocol: once consumers wire dispatch accounting into the
-// device tracker, one quiescence query certifies no GPU work touches host
-// memory. v0.1 caveat: no production path increments the tracker yet —
-// see Concepts → Epoch Tracking before relying on this.
-if device.is_quiescent() {
-    gc_compact();
-}
+// GC-safety protocol — v0.1 exercises it at TRACKER level only: consumer
+// dispatch accounting is not yet wired into the device tracker, so a zero
+// device count proves nothing was counted, not that the GPU is idle.
+// Do not drive compaction off device.is_quiescent() today.
+use zunesha::GpuEpochTracker;
+let tracker = GpuEpochTracker::new();
+tracker.begin_dispatch();
+assert!(!tracker.is_quiescent());
+tracker.end_dispatch();
+assert!(tracker.is_quiescent());
 ```
 
 ## Running the examples

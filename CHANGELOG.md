@@ -5,6 +5,26 @@ All notable changes to Zunesha are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+### Fixed — review findings, round 2 (2026-10-01)
+
+- Compaction call removed from current-release examples: the README
+  and book quick starts now demonstrate the protocol with an
+  explicitly controlled pure-tracker example (`GpuEpochTracker`
+  begin/end/is_quiescent) and state outright that
+  `device.is_quiescent()` must not drive compaction today. The
+  architecture chapter's tracker claims (source and book copy)
+  downgraded to the designed-to-be guarantee with the v0.1
+  accounting caveat.
+- Goldenweek restored as the **live** consumer (borrows
+  `zunesha::VulkanDevice`, wraps `zunesha::Buffer`s — verified against
+  Goldenweek develop); Borsalino remains the pending migration. The
+  "examples/tests only" assertion is gone; buffer-ownership prose now
+  says Goldenweek wraps today, Borsalino not yet. README ecosystem
+  table matches.
+- Architecture source's remaining `../src/lib.rs` link fixed at the
+  source this time (the first fix edited the book copy only and a
+  re-carry reintroduced it); rendered-link walk zero on both books.
+
 ### Fixed — review findings (2026-10-01)
 
 - Book no longer recommends GC compaction on the device counter: the

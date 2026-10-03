@@ -23,6 +23,9 @@ stay in the consumer libraries; Zunesha is the substrate they stand on.
   of v0.1 no production dispatch path increments the tracker yet; see
   [Epoch Tracking & Quiescence](./concepts/epoch.md) for the exact current
   status.
+- **A live consumer** — Goldenweek (graphics) already borrows a
+  `zunesha::VulkanDevice` and wraps `zunesha::Buffer`s; Borsalino's
+  (compute) migration is planned.
 - **Surface-agnostic** — no windowing, no presentation, no shader compilation.
 
 ## Why It Exists
