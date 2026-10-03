@@ -3,6 +3,7 @@
 [![crates.io](https://img.shields.io/crates/v/zunesha)](https://crates.io/crates/zunesha)
 [![docs.rs](https://img.shields.io/docsrs/zunesha)](https://docs.rs/zunesha)
 [![CI](https://github.com/Industrial-Algebra/Zunesha/actions/workflows/ci.yml/badge.svg)](https://github.com/Industrial-Algebra/Zunesha/actions/workflows/ci.yml)
+[![Docs](https://img.shields.io/badge/docs-book-blue)](https://zunesha.industrial-algebra.com)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](./LICENSE)
 
 Shared GPU **device substrate** for the Industrial Algebra ecosystem.
@@ -56,19 +57,24 @@ if device.queues().has_graphics() {
 // Buffers are the shared primitive — compute writes, graphics reads.
 let buf = device.create_buffer(&[1.0f32, 2.0, 3.0, 4.0])?;
 
-// GC safety: one quiescence query certifies NO GPU work (compute or graphics)
-// is touching host memory before a moving GC compacts.
-if device.is_quiescent() {
-    gc_compact();
-}
+// GC-safety protocol (v0.1: exercised at tracker level — consumer dispatch
+// accounting is not yet wired into the device tracker; see docs/critique.md).
+// Do NOT drive compaction off device.is_quiescent() today: a zero count
+// currently proves nothing was counted, not that the GPU is idle.
+use zunesha::GpuEpochTracker;
+let tracker = GpuEpochTracker::new();
+tracker.begin_dispatch();
+assert!(!tracker.is_quiescent());
+tracker.end_dispatch();
+assert!(tracker.is_quiescent());
 ```
 
 ## Relation to the ecosystem
 
 | Project | Relationship |
 |---|---|
-| **Borsalino** | Compute consumer of Zunesha. Holds a `zunesha::Device`, dispatches compute on `queues().compute`. |
-| **Goldenweek** | Graphics consumer of Zunesha. Requires `queues().has_graphics()`, renders against the surface. |
+| **Goldenweek** | **Live graphics consumer.** Borrows a `zunesha::VulkanDevice`, allocates and wraps `zunesha::Buffer`s (`vulkan` feature). |
+| **Borsalino** | Intended compute consumer — migration planned, not yet landed; Borsalino still owns its device internally. |
 | **Baedeker** | WASM host. Creates one Zunesha device, hands it to both the compute and graphics host modules. |
 | **Miriami** | Trans-graphical framework (future). Lowers its geometric projection onto Goldenweek, which sits on Zunesha. |
 
@@ -113,11 +119,11 @@ if device.is_quiescent() {
 | Backend | Platform | Feature | Status |
 |---|---|---|---|
 | Metal | macOS (Apple Silicon) | `metal` | 🚧 post-v0.1 — raw `objc_msgSend` FFI |
-| Vulkan | Linux, Windows | `vulkan` | 🚧 post-v0.1 — raw `ash` FFI |
+| Vulkan | Linux, Windows | `vulkan` | ✅ ships in v0.1 — raw `ash` FFI |
 | Stub | Any | (none) | ✅ `NoDeviceStub` — safe fallback |
 
 v0.1 ships the [`Device`] trait, the buffer/queue/quiescence types, the ported
-epoch tracker, and a `NoDeviceStub`. Both backends hand-roll their FFI (no
+epoch tracker, the complete Vulkan backend, and a `NoDeviceStub`. Both backends hand-roll their FFI (no
 `wgpu`) to match Borsalino/Goldenweek's auditability.
 
 ## Design refusals (v0.1)
