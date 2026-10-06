@@ -39,10 +39,10 @@
 //!
 //! ## Backends
 //!
-//! | Feature  | Platform       | Status (v0.1)        |
-//! |----------|----------------|----------------------|
-//! | `metal`  | macOS          | 🚧 Trait + stub only |
-//! | `vulkan` | Linux, Windows | 🚧 Trait + stub only |
+//! | Feature  | Platform       | Status (v0.1)                                    |
+//! |----------|----------------|--------------------------------------------------|
+//! | `metal`  | macOS          | 🚧 Trait + stub only                             |
+//! | `vulkan` | Linux, Windows | ✅ Device, queues, host-visible + device-local   |
 //!
 //! v0.1 ships the [`Device`] trait, the [`Buffer`] / queue / quiescence types,
 //! the ported [`epoch`] tracker, and a [`NoDeviceStub`]. The Vulkan backend is
@@ -90,6 +90,24 @@ pub enum MemoryStrategy {
     Unified,
     /// Force device-local memory with staging transfers (discrete GPUs).
     /// Best for NVIDIA RTX, AMD RDNA, Intel Arc.
+    DeviceLocal,
+}
+
+/// Where a device's buffers actually live.
+///
+/// [`MemoryStrategy`] is the *request*; this is the *resolution*.
+/// [`MemoryStrategy::Auto`] picks a concrete placement at device
+/// initialisation, and [`Device::buffer_placement`] reports which one — so consumers and tests can observe where the bytes
+/// landed instead of re-deriving the hardware heuristic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryPlacement {
+    /// Host-visible, directly CPU-mappable memory — the
+    /// [`MemoryStrategy::Unified`] request, or `Auto` on integrated/unified
+    /// hardware.
+    HostVisible,
+    /// Dedicated device-local memory reached through staging transfers — the
+    /// [`MemoryStrategy::DeviceLocal`] request, or `Auto` on discrete-class
+    /// hardware (see the `detect_device_local` heuristic in the backend).
     DeviceLocal,
 }
 
@@ -314,14 +332,24 @@ impl<'a> Default for BufferPinHandle<'a> {
     }
 }
 
-/// Compile-time proof that no GPU operations are outstanding.
+/// Proof that no GPU operations were outstanding at a past instant.
 ///
 /// Required by GC-sensitive contexts. Constructed via
 /// [`Device::prove_quiescent`] when [`Device::is_quiescent`] returns true.
 ///
-/// This proof certifies that the epoch counter was zero at construction time —
-/// no dispatches were in-flight. Combined with [`GpuEpochTracker`], this
-/// ensures GC compaction is safe.
+/// # What this certifies — and what it does not
+///
+/// The proof certifies a **past** state: the epoch counter was zero at
+/// construction time. Between obtaining the proof and acting on it (e.g.
+/// calling `dispatch_verified_gc`), another thread may have begun a
+/// dispatch; `SeqCst` ordering does not close that race. The proof is a
+/// capability token — it makes unverified compaction a compile error —
+/// not a guarantee that quiescence *holds* at the moment of use.
+///
+/// Closing the window is the consumer's discipline: a single dispatcher
+/// thread, or holding a lock that the dispatch path also takes, makes the
+/// proof sound. (Found by the 2026-09-29 Borsalino research dive; same
+/// caveat applies to Borsalino's `QuiescenceProof`.)
 #[derive(Clone, Copy, Debug)]
 pub struct QuiescenceProof {
     _private: (),
@@ -369,6 +397,13 @@ pub trait Device: Sized {
 
     /// The memory strategy this device was initialised with.
     fn memory_strategy(&self) -> MemoryStrategy;
+
+    /// The *effective* placement of buffers this device allocates.
+    ///
+    /// Differs from [`memory_strategy`](Self::memory_strategy) exactly when
+    /// the strategy is [`MemoryStrategy::Auto`]: this reports what `Auto`
+    /// resolved to on this hardware, not the request.
+    fn buffer_placement(&self) -> MemoryPlacement;
 
     /// Allocate a buffer and upload initial data.
     fn create_buffer<T: bytemuck::Pod>(&self, data: &[T]) -> Result<Buffer>;
@@ -429,6 +464,10 @@ pub trait Device: Sized {
     }
 
     /// Construct a [`QuiescenceProof`] if the device is currently idle.
+    ///
+    /// Certifies a **past** instant — see [`QuiescenceProof`] for the
+    /// time-of-check/time-of-use window and the consumer discipline that
+    /// closes it.
     fn prove_quiescent(&self) -> Option<QuiescenceProof> {
         if self.is_quiescent() {
             Some(QuiescenceProof { _private: () })
@@ -462,6 +501,12 @@ impl Device for NoDeviceStub {
     }
     fn memory_strategy(&self) -> MemoryStrategy {
         MemoryStrategy::Auto
+    }
+
+    fn buffer_placement(&self) -> MemoryPlacement {
+        // The stub never allocates; HostVisible is the documented default so
+        // the enum is total for every Device implementation.
+        MemoryPlacement::HostVisible
     }
     fn create_buffer<T: bytemuck::Pod>(&self, _data: &[T]) -> Result<Buffer> {
         Err(DeviceError::NoDevice)
@@ -547,6 +592,16 @@ mod tests {
         assert_eq!(q.compute.family_index, u32::MAX);
         assert!(q.graphics.is_none());
         assert!(!q.has_graphics());
+    }
+
+    #[test]
+    fn stub_placement_is_host_visible() {
+        // The stub never allocates; HostVisible is its documented default so
+        // the enum is total for every Device implementation.
+        assert_eq!(
+            NoDeviceStub.buffer_placement(),
+            MemoryPlacement::HostVisible
+        );
     }
 
     #[test]

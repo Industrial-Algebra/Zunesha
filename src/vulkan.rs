@@ -24,8 +24,8 @@ use ash::vk::Handle;
 use ash::{Entry, vk};
 
 use crate::{
-    Device, DeviceError, DeviceLimits, GpuEpochTracker, InitRequest, MemoryStrategy, Queue, Queues,
-    Result,
+    Device, DeviceError, DeviceLimits, GpuEpochTracker, InitRequest, MemoryPlacement,
+    MemoryStrategy, Queue, Queues, Result,
 };
 
 // ── Queue family selection (capability-driven, policy A) ──────────
@@ -821,6 +821,14 @@ impl Device for VulkanDevice {
         self.memory_strategy
     }
 
+    fn buffer_placement(&self) -> MemoryPlacement {
+        if self.uses_device_local {
+            MemoryPlacement::DeviceLocal
+        } else {
+            MemoryPlacement::HostVisible
+        }
+    }
+
     fn create_buffer<T: bytemuck::Pod>(&self, data: &[T]) -> Result<crate::Buffer> {
         let byte_len = mem::size_of_val(data) as vk::DeviceSize;
         let aligned = if byte_len == 0 {
@@ -1002,10 +1010,65 @@ mod tests {
     /// supporting `VK_KHR_swapchain` (the rendering prerequisite). On a
     /// compute-only host neither is guaranteed — the test then reports the
     /// degradation instead of asserting.
+    /// Apply the `ZUNESHA_TEST_DEVICE` pin convention (mirrors Goldenweek's
+    /// `GOLDENWEEK_TEST_DEVICE`, Goldenweek ADR 0002): when set, the value is
+    /// a case-insensitive device-name substring that wins over capability
+    /// scoring. Unset → the request is passed through unchanged.
+    fn pinned(request: InitRequest) -> InitRequest {
+        match std::env::var("ZUNESHA_TEST_DEVICE") {
+            Ok(hint) if !hint.is_empty() => request.with_device_hint(hint),
+            _ => request,
+        }
+    }
+
+    /// `buffer_placement` reports the *effective* placement — what the
+    /// requested strategy resolved to — not the request. Explicit strategies
+    /// are deterministic; `Auto` resolves per hardware and must always be
+    /// concrete (never panic, always one of the two variants).
+    #[test]
+    #[serial]
+    fn placement_reports_effective_not_requested() {
+        let unified = match VulkanDevice::init_with_strategy(MemoryStrategy::Unified) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Vulkan device ({e})");
+                return;
+            }
+        };
+        assert_eq!(unified.buffer_placement(), MemoryPlacement::HostVisible);
+        assert_eq!(unified.memory_strategy(), MemoryStrategy::Unified);
+
+        let discrete = match VulkanDevice::init_with_strategy(MemoryStrategy::DeviceLocal) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Vulkan device ({e})");
+                return;
+            }
+        };
+        assert_eq!(discrete.buffer_placement(), MemoryPlacement::DeviceLocal);
+        assert_eq!(discrete.memory_strategy(), MemoryStrategy::DeviceLocal);
+
+        let auto = match VulkanDevice::init() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Vulkan device ({e})");
+                return;
+            }
+        };
+        assert_eq!(auto.memory_strategy(), MemoryStrategy::Auto);
+        assert!(
+            matches!(
+                auto.buffer_placement(),
+                MemoryPlacement::HostVisible | MemoryPlacement::DeviceLocal
+            ),
+            "Auto must resolve to a concrete placement on any hardware"
+        );
+    }
+
     #[test]
     #[serial]
     fn graphics_init_enables_swapchain_and_graphics_queue() {
-        let device = match VulkanDevice::init_with(InitRequest::prefer_graphics()) {
+        let device = match VulkanDevice::init_with(pinned(InitRequest::prefer_graphics())) {
             Ok(d) => d,
             Err(e) => {
                 eprintln!("skipping: no Vulkan device ({e})");
@@ -1157,7 +1220,7 @@ mod tests {
     #[test]
     #[serial]
     fn prefer_graphics_exposes_graphics_when_available() {
-        let device = match VulkanDevice::init_with(InitRequest::prefer_graphics()) {
+        let device = match VulkanDevice::init_with(pinned(InitRequest::prefer_graphics())) {
             Ok(d) => d,
             Err(e) => {
                 eprintln!("skipping: no Vulkan device ({e})");
