@@ -105,13 +105,16 @@ assert!(tracker.is_quiescent());
   hardware (NVIDIA Grace Blackwell GB10 / DGX Spark, headless datacenter GPUs,
   cloud compute instances). Goldenweek refuses to initialise where
   `queues().graphics` is `None`.
-- **Buffer ownership.** `zunesha::Buffer` is the shared primitive;
-  `Borsalino::GpuBuffer` and `Goldenweek::GpuBuffer` both wrap it. A buffer
-  allocated for compute *is* the memory a render pipeline binds.
-- **Unified GC safety.** The epoch tracker (ported from Borsalino) observes
-  *every* dispatch through the device — compute and graphics — so a single
-  quiescence query certifies no GPU work touches host memory before a moving GC
-  compacts. Strictly stronger than the per-library tracking it replaces.
+- **Buffer ownership.** `zunesha::Buffer` is the shared primitive.
+  `Goldenweek::GpuBuffer` wraps it today; `Borsalino::GpuBuffer` does not yet
+  (migration pending). Once both wrap it, a buffer allocated for compute *is*
+  the memory a render pipeline binds.
+- **Unified GC safety (intended guarantee).** The epoch tracker (ported from
+  Borsalino) is designed so one quiescence query certifies no GPU work touches
+  host memory before a moving GC compacts — strictly stronger than per-library
+  tracking. Current status: consumer dispatch accounting is not yet wired into
+  the device tracker (see `docs/critique.md` #1), so the device counter alone
+  is not evidence permitting compaction today.
 - **Surface-agnostic.** Zunesha does no windowing and compiles no shaders.
 
 ## Backends
