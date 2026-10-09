@@ -738,6 +738,94 @@ impl VulkanDevice {
             | vk::BufferUsageFlags::TRANSFER_DST
     }
 
+    /// Shared buffer allocation path.
+    ///
+    /// `data` uploads `byte_len` bytes when present (`None` = uninitialised).
+    /// `force_device_local` takes the device-local + staging path even when
+    /// the negotiated strategy is host-visible — the
+    /// [`Device::create_device_buffer`](crate::Device::create_device_buffer)
+    /// contract: GPU-resident data under a forced-`Unified` device (found by
+    /// the Borsalino migration survey; its own backend overrides the same
+    /// way).
+    fn buffer_new(
+        &self,
+        byte_len: vk::DeviceSize,
+        data: Option<*const c_void>,
+        force_device_local: bool,
+    ) -> Result<crate::Buffer> {
+        let aligned = if byte_len == 0 {
+            self.limits.min_storage_buffer_offset_alignment
+        } else {
+            align_up(byte_len, self.limits.min_storage_buffer_offset_alignment)
+        };
+        let usage = Self::buffer_usage();
+
+        let (buffer, memory, mapped, staging_buffer, staging_memory) = if self.uses_device_local
+            || force_device_local
+        {
+            // Device-local buffer + host-visible staging; copy data →
+            // staging, then staging → device.
+            let (dev_buf, dev_mem) = unsafe {
+                allocate_device_local_buffer(&self.device, &self.memory_properties, aligned, usage)?
+            };
+            let (stg_buf, stg_mem, stg_mapped) = unsafe {
+                allocate_buffer(
+                    &self.device,
+                    &self.memory_properties,
+                    aligned,
+                    vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
+                )?
+            };
+            if let Some(src) = data {
+                if byte_len > 0 {
+                    unsafe { ptr::copy_nonoverlapping(src, stg_mapped, byte_len as usize) };
+                    unsafe {
+                        one_shot_transfer(
+                            &self.device,
+                            self.command_pool,
+                            self.compute_queue,
+                            |cmd| {
+                                let copy = vk::BufferCopy::default().size(aligned);
+                                self.device.cmd_copy_buffer(
+                                    cmd,
+                                    stg_buf,
+                                    dev_buf,
+                                    std::slice::from_ref(&copy),
+                                );
+                            },
+                        )?;
+                    }
+                }
+            }
+            (dev_buf, dev_mem, stg_mapped, Some(stg_buf), Some(stg_mem))
+        } else {
+            // Unified memory: single host-visible buffer.
+            let (buf, mem, mapped) =
+                unsafe { allocate_buffer(&self.device, &self.memory_properties, aligned, usage)? };
+            if let Some(src) = data {
+                if byte_len > 0 {
+                    unsafe { ptr::copy_nonoverlapping(src, mapped, byte_len as usize) };
+                }
+            }
+            (buf, mem, mapped, None, None)
+        };
+
+        let inner = Box::new(VulkanBufferInner {
+            buffer,
+            memory,
+            size: aligned,
+            mapped,
+            staging_buffer,
+            staging_memory,
+            device: self.device.clone(),
+        });
+        Ok(crate::Buffer {
+            raw: Box::into_raw(inner) as *mut c_void,
+            len: byte_len as usize,
+            drop_fn: drop_vulkan_buffer,
+        })
+    }
+
     /// The Vulkan entry (loader handle) this device was created from.
     ///
     /// Exposed so graphics consumers can load instance-extension function
@@ -830,128 +918,33 @@ impl Device for VulkanDevice {
     }
 
     fn create_buffer<T: bytemuck::Pod>(&self, data: &[T]) -> Result<crate::Buffer> {
-        let byte_len = mem::size_of_val(data) as vk::DeviceSize;
-        let aligned = if byte_len == 0 {
-            self.limits.min_storage_buffer_offset_alignment
-        } else {
-            align_up(byte_len, self.limits.min_storage_buffer_offset_alignment)
-        };
-        let usage = Self::buffer_usage();
-
-        let (buffer, memory, mapped, staging_buffer, staging_memory) = if self.uses_device_local {
-            // Device-local buffer + host-visible staging; copy data → staging,
-            // then staging → device.
-            let (dev_buf, dev_mem) = unsafe {
-                allocate_device_local_buffer(&self.device, &self.memory_properties, aligned, usage)?
-            };
-            let (stg_buf, stg_mem, stg_mapped) = unsafe {
-                allocate_buffer(
-                    &self.device,
-                    &self.memory_properties,
-                    aligned,
-                    vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
-                )?
-            };
-            if byte_len > 0 {
-                unsafe {
-                    ptr::copy_nonoverlapping(
-                        data.as_ptr() as *const c_void,
-                        stg_mapped,
-                        byte_len as usize,
-                    );
-                }
-                unsafe {
-                    one_shot_transfer(
-                        &self.device,
-                        self.command_pool,
-                        self.compute_queue,
-                        |cmd| {
-                            let copy = vk::BufferCopy::default().size(aligned);
-                            self.device.cmd_copy_buffer(
-                                cmd,
-                                stg_buf,
-                                dev_buf,
-                                std::slice::from_ref(&copy),
-                            );
-                        },
-                    )?;
-                }
-            }
-            (dev_buf, dev_mem, stg_mapped, Some(stg_buf), Some(stg_mem))
-        } else {
-            // Unified memory: single host-visible buffer.
-            let (buf, mem, mapped) =
-                unsafe { allocate_buffer(&self.device, &self.memory_properties, aligned, usage)? };
-            if byte_len > 0 {
-                unsafe {
-                    ptr::copy_nonoverlapping(
-                        data.as_ptr() as *const c_void,
-                        mapped,
-                        byte_len as usize,
-                    );
-                }
-            }
-            (buf, mem, mapped, None, None)
-        };
-
-        let inner = Box::new(VulkanBufferInner {
-            buffer,
-            memory,
-            size: aligned,
-            mapped,
-            staging_buffer,
-            staging_memory,
-            device: self.device.clone(),
-        });
-        Ok(crate::Buffer {
-            raw: Box::into_raw(inner) as *mut c_void,
-            len: byte_len as usize,
-            drop_fn: drop_vulkan_buffer,
-        })
+        self.buffer_new(
+            mem::size_of_val(data) as vk::DeviceSize,
+            Some(data.as_ptr() as *const c_void),
+            false,
+        )
     }
 
     fn create_buffer_uninit<T: bytemuck::Pod>(&self, len: usize) -> Result<crate::Buffer> {
-        let byte_len = (len * mem::size_of::<T>()) as vk::DeviceSize;
-        let aligned = if byte_len == 0 {
-            self.limits.min_storage_buffer_offset_alignment
-        } else {
-            align_up(byte_len, self.limits.min_storage_buffer_offset_alignment)
-        };
-        let usage = Self::buffer_usage();
+        self.buffer_new((len * mem::size_of::<T>()) as vk::DeviceSize, None, false)
+    }
 
-        let (buffer, memory, mapped, staging_buffer, staging_memory) = if self.uses_device_local {
-            let (dev_buf, dev_mem) = unsafe {
-                allocate_device_local_buffer(&self.device, &self.memory_properties, aligned, usage)?
-            };
-            let (stg_buf, stg_mem, stg_mapped) = unsafe {
-                allocate_buffer(
-                    &self.device,
-                    &self.memory_properties,
-                    aligned,
-                    vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
-                )?
-            };
-            (dev_buf, dev_mem, stg_mapped, Some(stg_buf), Some(stg_mem))
-        } else {
-            let (buf, mem, mapped) =
-                unsafe { allocate_buffer(&self.device, &self.memory_properties, aligned, usage)? };
-            (buf, mem, mapped, None, None)
-        };
+    /// Forces the device-local + staging path regardless of the negotiated
+    /// strategy (Borsalino's GPU-resident-weights contract; see
+    /// [`VulkanDevice::buffer_new`]). On hardware with no distinct
+    /// device-local heap the `DEVICE_LOCAL`-flagged memory type is used
+    /// wherever the driver exposes one.
+    fn create_device_buffer<T: bytemuck::Pod>(&self, data: &[T]) -> Result<crate::Buffer> {
+        self.buffer_new(
+            mem::size_of_val(data) as vk::DeviceSize,
+            Some(data.as_ptr() as *const c_void),
+            true,
+        )
+    }
 
-        let inner = Box::new(VulkanBufferInner {
-            buffer,
-            memory,
-            size: aligned,
-            mapped,
-            staging_buffer,
-            staging_memory,
-            device: self.device.clone(),
-        });
-        Ok(crate::Buffer {
-            raw: Box::into_raw(inner) as *mut c_void,
-            len: byte_len as usize,
-            drop_fn: drop_vulkan_buffer,
-        })
+    /// Uninitialised variant of [`create_device_buffer`](Self::create_device_buffer).
+    fn create_device_buffer_uninit<T: bytemuck::Pod>(&self, len: usize) -> Result<crate::Buffer> {
+        self.buffer_new((len * mem::size_of::<T>()) as vk::DeviceSize, None, true)
     }
 
     fn read_buffer<T: bytemuck::Pod>(&self, buffer: &crate::Buffer) -> Result<Vec<T>> {
@@ -1234,5 +1227,65 @@ mod tests {
                 "no graphics on this host (compute-only) — preference honoured, no requirement"
             );
         }
+    }
+
+    /// `create_device_buffer` must allocate device-local even when the
+    /// device strategy is forced `Unified` — the contract Borsalino relies
+    /// on for GPU-resident weights (its own Vulkan backend overrides the
+    /// trait default the same way; found by the Borsalino migration survey,
+    /// migration plan §5.1).
+    ///
+    /// Observable via internals: a device-local allocation carries a staging
+    /// buffer; the strategy-respecting `create_buffer` under `Unified` does
+    /// not. Both must still upload and read back exactly.
+    #[test]
+    #[serial]
+    fn device_buffer_forces_device_local_under_unified_strategy() {
+        let device = match VulkanDevice::init_with_strategy(MemoryStrategy::Unified) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Vulkan device ({e})");
+                return;
+            }
+        };
+
+        // The forced path needs a real device-local heap: only meaningful
+        // on discrete GPUs (the RTX 5080 seat). Integrated/CPU devices have
+        // no distinct local heap to force.
+        let props = unsafe {
+            device
+                .instance
+                .get_physical_device_properties(device.physical_device)
+        };
+        if props.device_type != vk::PhysicalDeviceType::DISCRETE_GPU {
+            eprintln!(
+                "skipping: {} is not discrete — no device-local heap to force",
+                unsafe { CStr::from_ptr(props.device_name.as_ptr()) }.to_string_lossy()
+            );
+            return;
+        }
+
+        let unified = device.create_buffer(&[1.0f32, 2.0, 3.0, 4.0]).unwrap();
+        let forced = device
+            .create_device_buffer(&[1.0f32, 2.0, 3.0, 4.0])
+            .unwrap();
+
+        // Safety: both handles were produced by this device's create paths.
+        let u = unsafe { &*(unified.raw as *const VulkanBufferInner) };
+        let f = unsafe { &*(forced.raw as *const VulkanBufferInner) };
+        assert!(
+            u.staging_buffer.is_none(),
+            "Unified-strategy create_buffer must stay host-visible"
+        );
+        assert!(
+            f.staging_buffer.is_some(),
+            "create_device_buffer must force the device-local + staging path"
+        );
+
+        // Both placements upload and read back exactly.
+        let r1: Vec<f32> = device.read_buffer(&unified).unwrap();
+        let r2: Vec<f32> = device.read_buffer(&forced).unwrap();
+        assert_eq!(r1, vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(r2, vec![1.0, 2.0, 3.0, 4.0]);
     }
 }

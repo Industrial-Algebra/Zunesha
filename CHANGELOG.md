@@ -5,6 +5,22 @@ All notable changes to Zunesha are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `VulkanDevice` now overrides `create_device_buffer` /
+  `create_device_buffer_uninit` to **force device-local + staging
+  allocation regardless of the negotiated strategy** — a consumer that
+  forces `MemoryStrategy::Unified` on discrete hardware still gets
+  VRAM-resident data for GPU-resident weights. Found by the Borsalino
+  migration survey (its own backend overrides the same way); the trait
+  docs now state the override contract. Behavior-preserving refactor:
+  `create_buffer`/`create_buffer_uninit` delegate to a shared
+  `buffer_new` path (also removes their internal duplication). Pinned by
+  `device_buffer_forces_device_local_under_unified_strategy` (discrete-GPU
+  test, verified on RTX 5080).
+
 ## [0.1.0] — 2026-10-03
 
 ### Fixed — review findings, round 3 (2026-10-03)

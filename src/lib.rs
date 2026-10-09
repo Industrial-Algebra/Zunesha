@@ -414,7 +414,16 @@ pub trait Device: Sized {
     /// Allocate a device-local buffer and upload initial data.
     ///
     /// Persists across dispatches without CPU readback overhead. On unified
-    /// memory (Apple Silicon, GB10) identical to [`create_buffer`](Self::create_buffer).
+    /// memory (Apple Silicon, GB10) identical to
+    /// [`create_buffer`](Self::create_buffer).
+    ///
+    /// **Override contract:** backends that distinguish memory placement
+    /// override this (and the `_uninit` twin) to force device-local
+    /// allocation **regardless of the negotiated strategy** — a consumer
+    /// that forced [`MemoryStrategy::Unified`] on discrete hardware still
+    /// gets VRAM-resident data here (GPU-resident weights; Borsalino's
+    /// contract). The trait default delegates to `create_buffer` for
+    /// placement-blind backends.
     fn create_device_buffer<T: bytemuck::Pod>(&self, data: &[T]) -> Result<Buffer> {
         self.create_buffer(data)
     }
