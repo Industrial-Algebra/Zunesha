@@ -942,8 +942,8 @@ impl Device for VulkanDevice {
     }
 
     /// Forces the device-local + staging path regardless of the negotiated
-    /// strategy (Borsalino's GPU-resident-weights contract; see
-    /// [`VulkanDevice::buffer_new`]). On hardware with no distinct
+    /// strategy (Borsalino's GPU-resident-weights contract; see the shared
+    /// `buffer_new` allocation path). On hardware with no distinct
     /// device-local heap the `DEVICE_LOCAL`-flagged memory type is used
     /// wherever the driver exposes one.
     fn create_device_buffer<T: bytemuck::Pod>(&self, data: &[T]) -> Result<crate::Buffer> {
