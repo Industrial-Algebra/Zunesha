@@ -205,6 +205,16 @@ impl Queue {
     }
 }
 
+// Safety: `Queue` is a plain handle value (the same shape ash's own handle
+// types carry, which assert Send+Sync the same way). Sharing the *value*
+// across threads is safe: the driver owns the pointed-to object, and all
+// submission paths that use the handle are serialized by the consumer's
+// dispatch discipline (host-synchronous today — see the architecture doc's
+// cross-queue note). This also unblocks `VulkanDevice: Send + Sync`, which
+// consumers (Borsalino) need to share one device behind an `Arc`.
+unsafe impl Send for Queue {}
+unsafe impl Sync for Queue {}
+
 /// The queue families a [`Device`] exposes.
 ///
 /// Capability-driven: `compute` is always present (Zunesha's baseline

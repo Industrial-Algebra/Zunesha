@@ -621,6 +621,18 @@ impl Drop for VulkanDevice {
     }
 }
 
+// Compile-time proof that the device is shareable behind an `Arc` across
+// threads — Borsalino's consumer contract (its buffers/pulses may outlive
+// the backend and are moved between threads). Sound because: every field is
+// either an ash handle (Send+Sync by ash's own impls), the loader `Entry`
+// (fn tables + `Arc<Library>`), or the atomic epoch tracker; all mutation
+// goes through driver calls and atomics. Command-pool use is single-threaded
+// by the host-synchronous dispatch discipline (architecture doc).
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<VulkanDevice>();
+};
+
 impl VulkanDevice {
     /// Build a device from a full [`InitRequest`].
     fn build(request: InitRequest) -> Result<Self> {
