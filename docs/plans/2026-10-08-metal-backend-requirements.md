@@ -55,8 +55,10 @@ parity on non-macOS, tests + CI, backend ADR, docs.
     Apple Silicon; correct default everywhere),
   - `DeviceLocal` → `MTLStorageModePrivate` + Shared staging buffer +
     `MTLBlitCommandEncoder` copies (mirror Zunesha-Vulkan's staging design).
-    If that proves disproportionate for a first cut, return an explicit
-    `UnsupportedStrategy`-style error instead of silently degrading.
+    If *that* proves disproportionate for a first cut, return an explicit
+    `UnsupportedStrategy`-style error instead of silently degrading — this
+    allowance is scoped to the `create_buffer` strategy path only; the
+    `create_device_buffer` override (R3) has no such allowance.
 
 ### R2 — Capability-driven queues on Metal (needs an ADR)
 
@@ -84,10 +86,14 @@ Goldenweek must be told).
   alignment-floor semantics consistent with the Vulkan backend.
 - `read_buffer`: `contents()` pointer read for Shared; staging copy
   (Private → Shared via blit) for Private — mirror `VulkanDevice::read_buffer`.
-- `create_device_buffer(_uninit)`: **override** to force Private+staging even
-  under `Unified` strategy (same contract as the Vulkan 0.1.1 override — see
-  Borsalino migration plan §5.1; do not ship this backend without the
-  override).
+- `create_device_buffer(_uninit)`: **mandatory override** — force
+  Private+staging regardless of negotiated strategy, exactly matching the
+  Vulkan backend's post-0.1.1 contract (see Borsalino migration plan §5.1
+  and the Zunesha PR #9 override). **No deferral, no silent Shared
+  fallback** — the only acceptable alternative to Private+staging is a
+  hard error (no Private-capable heap). The R1 explicit-error allowance
+  applies ONLY to the `DeviceLocal` *strategy* path for `create_buffer`,
+  never to this override.
 - `create_buffer_pinned`: Shared storage is already zero-copy on unified
   memory; the pin handle remains a lifetime marker (trait default is fine).
 
@@ -108,6 +114,20 @@ Borsalino-Metal needs exactly three raw surfaces: MTLDevice (compile),
 MTLCommandQueue (dispatch), MTLBuffer (binding). Do not expose more than the
 trait + these require.
 
+**Consumer-side shader ABI the substrate must not break (review round 1):**
+kernels translated from WGSL via naga that use `arrayLength` dereference a
+synthesized `struct _mslBufferSizes` parameter that naga appends to the
+kernel signature (slot per the consumer's `sizes_buffer` compile option —
+Borsalino uses 30). The consumer must bind one **byte** size per
+runtime-sized-array global in **module declaration order** (naga 27 lays
+the struct fields out that way — field name `sizeN` uses the module-global
+index; binding order ≠ field order, and the width is one `uint` per
+runtime-array global, unbounded by any max-bindings constant). Borsalino
+PR #58 implements exactly this consumer side (`MetalPipelineInner` +
+`sizes_buffer_bindings` + `bind_buffer_sizes`, with CPU unit tests pinning
+the layout rule) — port it, keep it, and pin it with a regression test
+when Borsalino-Metal migrates onto this substrate.
+
 ### R5 — objc discipline (binding, with regression tests)
 
 These rules are lifted verbatim from Borsalino's battle history — violating
@@ -116,16 +136,31 @@ any of them produced a real crash once:
 1. **Every path that mints objc objects runs inside
    `objc::rc::autoreleasepool`** — including buffer creation and any
    consumer-facing path. On plain Rust worker threads autoreleased objects
-   are never reclaimed otherwise.
-2. **Release only `new`/`copy`/`retain` products.** Borrowed returns
-   (`commandBuffer`, `computeCommandEncoder`, `contents()`) are autoreleased
-   — releasing them is an over-release SIGSEGV (Borsalino's dispatch path
-   carried exactly this bug).
-3. **Objects that must escape a pool get an explicit `retain`** (Borsalino's
-   async `Pulse` command buffers). Regression test required: a retained
-   command buffer survives `autoreleasepool` drain and still completes.
-4. **Failure paths release what they own** — e.g. if queue creation fails
+   are never reclaimed otherwise. *Normative for this backend: Borsalino's
+   current metal.rs pools only the dispatch paths — init, compile, and
+   buffer creation lack pools. Matching Borsalino exactly would inherit
+   that gap; exceed it.*
+2. **Release only `new`/`copy`/`retain` products, exactly once.** Autoreleased
+   (+0) returns (`commandBuffer`, `computeCommandEncoder`) must NOT be
+   released — that is the over-release SIGSEGV Borsalino's dispatch path
+   carried once.
+3. **Escape accounting depends on what escapes:**
+   - An **autoreleased (+0)** object that must outlive its pool gets an
+     explicit `retain` (Borsalino's async `Pulse` command buffers);
+   - An **already-owned (+1)** product (`new…` methods, e.g.
+     `newBufferWithBytes`) transferred into a longer-lived structure needs
+     NO further retain — its existing +1 is the ownership; release it when
+     the structure drops (Borsalino's sizes-constant buffer: release after
+     `endEncoding`, safe because Metal retains resources referenced by
+     encoded commands). A blanket "retain everything that escapes"
+     double-counts and leaks.
+4. **`contents()` is a borrowed raw pointer, not an objc object** — never
+   release it; treat it as a memory address whose lifetime the owning
+   `MTLBuffer` governs.
+5. **Failure paths release what they own** — e.g. if queue creation fails
    after device creation, release the device before returning the error.
+6. **Pool-escape regression test required:** a retained (+0-escaped)
+   command buffer survives `autoreleasepool` drain and still completes.
 
 ### R6 — Lifetime, drop, quiescence
 
@@ -183,18 +218,21 @@ any of them produced a real crash once:
 - [ ] `ZUNESHA_REQUIRE_METAL=1` job fails hard when Metal is unreachable
 - [ ] Linux CI green with default features (stub path intact)
 - [ ] objc discipline rules R5.1–R5.4 each pinned by a passing test
-- [ ] `create_device_buffer` override present (R3) or explicitly deferred
-      with a tracking note
+- [ ] `create_device_buffer` override present (R3) — mandatory, no
+      deferral (the R1 explicit-error option covers only the
+      `DeviceLocal`-strategy `create_buffer` path)
 - [ ] Escape hatches R4 present with ownership-contract docs
 - [ ] Backend ADR accepted (queue reinterpretation R2, storage-mode mapping)
 - [ ] ROADMAP Metal item checked off; architecture doc backend table updated
 
 ## 6. Known unknowns for that session
 
-- Whether `min_storage_buffer_offset_alignment` should report 16 (Metal's
-  compute buffer alignment guarantee — Borsalino's Kani harnesses assume 16)
-  or a queried value; decide in the ADR and keep `DeviceLimits` semantics
-  documented.
+- Whether `min_storage_buffer_offset_alignment` should report 16 — a
+  **candidate, not evidence**: Borsalino's Kani harnesses *assume* 16 and
+  prove only the rounding arithmetic over that assumption; they neither
+  query nor model Metal. Confirm 16 against Metal's documented buffer
+  alignment requirements in the backend ADR (or report a queried value),
+  and keep `DeviceLimits` semantics documented either way.
 - `MTLHeap` allocation is **not** required for parity with Vulkan 0.1 —
   plain `newBufferWithLength` suffices; note as future work if fragmentation
   ever matters.
