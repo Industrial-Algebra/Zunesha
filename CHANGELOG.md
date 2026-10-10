@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — allocation-failure cleanup (2026-10-10)
+
+Found by the Borsalino Phase-2 review (PR #60 round 1): the buffer
+creation paths leaked partial state on allocation failure. Every failure
+step now frees what was created before it propagates:
+
+- `buffer_new` (device-local branch): staging-allocation failure frees
+  the device buffer+memory; upload-transfer failure frees both
+  allocations **only when nothing reached the GPU** and propagates the
+  original transfer error (r1: the detail was initially discarded).
+  After a successful submit with a failed wait, the GPU's access to the
+  buffers is indeterminate — that case deliberately leaks rather than
+  destroy in-flight resources (r2 P1), and sets a device-level
+  `unconfirmed_submission` flag (r3 P1s) that every destruction path
+  now honors: buffer drop and device teardown quiesce best-effort and
+  LEAK — with a stderr note — rather than destroy, if the device will
+  not quiesce (sound for persistent host-OOM and device loss alike).
+  Quiescing is SERIALIZED with submissions through the same lock
+  (r4 P1s: a lock-free quiesce could clear a taint a concurrent
+  submitter had just set — the lost pending-submission race — and
+  overlap `device_wait_idle` with in-flight queue use); the lock and
+  flag ship as one shared `TransferProtocol` Arc held by the device
+  and every buffer inner.
+
+### Fixed — protocol reentrancy (2026-10-10)
+
+- `with_compute_queue` is reentrant per THREAD (r5 P1 + a pre-existing
+  deadlock found by its reproduction): the submit lock provides
+  cross-THREAD exclusion only, so nested protocol entry on the holding
+  thread — the substrate's own device-local staging transfer during
+  `create_buffer`/`create_device_buffer` inside a consumer closure
+  (deadlocked since 0.1.1), and a buffer's teardown quiesce when the
+  buffer drops at closure end — skips the non-reentrant re-acquisition
+  via a thread-local depth marker. Regression:
+  `buffer_drop_inside_with_compute_queue_does_not_deadlock`
+  (timeout-guarded, RTX 5080).
+- Reentrancy is keyed PER PROTOCOL (r6 P1): a thread holding device1's
+  protocol must not skip device2's lock on a nested entry — the depth
+  is a thread-local map keyed by a unique protocol id, so cross-device
+  exclusion survives multi-device processes. Regression:
+  `nested_cross_device_entry_still_excludes` (deterministic
+  channel-ordered two-device test, RTX 5080; failed against the
+  thread-global marker).
+- `allocate_buffer`: memory-type lookup, `vkAllocateMemory`,
+  `vkBindBufferMemory`, and `vkMapMemory` failures destroy the buffer
+  (and free the memory once allocated).
+- `allocate_device_local_buffer`: same for memory-type lookup,
+  `vkAllocateMemory`, and `vkBindBufferMemory`.
+
+Closed in this patch (was r1 P3): `one_shot_transfer` frees its
+command buffer on every pre-submit failure path and documents why the
+pending command buffer must NOT be freed after a failed wait.
+
+Runtime fault injection is not feasible in a unit test (ash exposes no
+mock layer and a test-only allocator seam is out of patch scope); the
+cleanup is verified by construction and code review, matching the
+discipline Borsalino adopted for the same shapes.
+
 ### Added — Metal backend (ADR 0004)
 
 - **`metal` feature** (macOS, `dep:objc`): `MetalDevice` implementing

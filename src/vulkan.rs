@@ -343,41 +343,58 @@ unsafe fn allocate_buffer(
     let mut flags = vk::MemoryPropertyFlags::HOST_VISIBLE
         | vk::MemoryPropertyFlags::HOST_COHERENT
         | vk::MemoryPropertyFlags::HOST_CACHED;
-    let mem_type_index =
-        find_memory_type_index(memory_properties, mem_reqs.memory_type_bits, flags).or_else(
-            |_| {
+    let mem_type_index = {
+        let preferred = find_memory_type_index(memory_properties, mem_reqs.memory_type_bits, flags);
+        match preferred {
+            Ok(idx) => Ok(idx),
+            Err(e) => {
                 flags =
                     vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
                 find_memory_type_index(memory_properties, mem_reqs.memory_type_bits, flags)
-            },
-        )?;
+                    .inspect_err(|_| {
+                        // Free partial state: the buffer created above.
+                        unsafe { device.destroy_buffer(buffer, None) };
+                    })
+                    .map_err(|_| e)
+            }
+        }
+    }?;
 
     let alloc_info = vk::MemoryAllocateInfo::default()
         .allocation_size(mem_reqs.size)
         .memory_type_index(mem_type_index);
 
-    let memory = unsafe {
-        device.allocate_memory(&alloc_info, None).map_err(|e| {
-            DeviceError::BufferCreationFailed {
+    let memory = match unsafe { device.allocate_memory(&alloc_info, None) } {
+        Ok(memory) => memory,
+        Err(e) => {
+            unsafe { device.destroy_buffer(buffer, None) };
+            return Err(DeviceError::BufferCreationFailed {
                 message: format!("vkAllocateMemory: {e}"),
-            }
-        })?
+            });
+        }
     };
 
-    unsafe {
-        device.bind_buffer_memory(buffer, memory, 0).map_err(|e| {
-            DeviceError::BufferCreationFailed {
-                message: format!("vkBindBufferMemory: {e}"),
-            }
-        })?;
+    if let Err(e) = unsafe { device.bind_buffer_memory(buffer, memory, 0) } {
+        unsafe {
+            device.free_memory(memory, None);
+            device.destroy_buffer(buffer, None);
+        }
+        return Err(DeviceError::BufferCreationFailed {
+            message: format!("vkBindBufferMemory: {e}"),
+        });
     }
 
-    let mapped = unsafe {
-        device
-            .map_memory(memory, 0, size, vk::MemoryMapFlags::empty())
-            .map_err(|e| DeviceError::BufferCreationFailed {
+    let mapped = match unsafe { device.map_memory(memory, 0, size, vk::MemoryMapFlags::empty()) } {
+        Ok(mapped) => mapped,
+        Err(e) => {
+            unsafe {
+                device.free_memory(memory, None);
+                device.destroy_buffer(buffer, None);
+            }
+            return Err(DeviceError::BufferCreationFailed {
                 message: format!("vkMapMemory: {e}"),
-            })?
+            });
+        }
     };
 
     Ok((buffer, memory, mapped))
@@ -413,26 +430,34 @@ unsafe fn allocate_device_local_buffer(
         memory_properties,
         mem_reqs.memory_type_bits,
         vk::MemoryPropertyFlags::DEVICE_LOCAL,
-    )?;
+    )
+    .inspect_err(|_| {
+        // Free partial state: the buffer created above.
+        unsafe { device.destroy_buffer(buffer, None) };
+    })?;
 
     let alloc_info = vk::MemoryAllocateInfo::default()
         .allocation_size(mem_reqs.size)
         .memory_type_index(mem_type_index);
 
-    let memory = unsafe {
-        device.allocate_memory(&alloc_info, None).map_err(|e| {
-            DeviceError::BufferCreationFailed {
+    let memory = match unsafe { device.allocate_memory(&alloc_info, None) } {
+        Ok(memory) => memory,
+        Err(e) => {
+            unsafe { device.destroy_buffer(buffer, None) };
+            return Err(DeviceError::BufferCreationFailed {
                 message: format!("vkAllocateMemory(device-local): {e}"),
-            }
-        })?
+            });
+        }
     };
 
-    unsafe {
-        device.bind_buffer_memory(buffer, memory, 0).map_err(|e| {
-            DeviceError::BufferCreationFailed {
-                message: format!("vkBindBufferMemory(device-local): {e}"),
-            }
-        })?;
+    if let Err(e) = unsafe { device.bind_buffer_memory(buffer, memory, 0) } {
+        unsafe {
+            device.free_memory(memory, None);
+            device.destroy_buffer(buffer, None);
+        }
+        return Err(DeviceError::BufferCreationFailed {
+            message: format!("vkBindBufferMemory(device-local): {e}"),
+        });
     }
 
     Ok((buffer, memory))
@@ -443,53 +468,130 @@ unsafe fn allocate_device_local_buffer(
 /// # Safety
 ///
 /// Vulkan FFI.
-unsafe fn one_shot_transfer(
-    device: &ash::Device,
-    command_pool: vk::CommandPool,
-    queue: vk::Queue,
-    record: impl FnOnce(vk::CommandBuffer),
-) -> Result<()> {
-    unsafe {
-        let alloc_info = vk::CommandBufferAllocateInfo::default()
-            .command_pool(command_pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        let cmd = device.allocate_command_buffers(&alloc_info).map_err(|e| {
-            DeviceError::BufferCreationFailed {
-                message: format!("transfer allocate: {e}"),
+/// One-shot transfer. The error's `bool` is **"submission reached the
+/// GPU"**: `false` means nothing was submitted (allocate/begin/end/submit
+/// failed — the recorded resources are untouched and safe to reclaim);
+/// `true` means submission succeeded but the wait failed — the GPU's
+/// access to the recorded resources is **indeterminate** (the spec
+/// permits e.g. host-OOM from the wait; it is neither proof of device
+/// loss nor of completion), so reclaiming them would be a driver-level
+/// use-after-free. The sound side is to leak (review r2 P1).
+impl VulkanDevice {
+    /// One-shot transfer. The error's `bool` is **"submission reached the
+    /// GPU"**: `false` means nothing was submitted (allocate/begin/end/
+    /// submit failed — the recorded resources are untouched and safe to
+    /// reclaim); `true` means submission succeeded but the wait failed —
+    /// the GPU's access to the recorded resources is **indeterminate**
+    /// (the spec permits e.g. host-OOM from the wait; it is neither proof
+    /// of device loss nor of completion), so reclaiming them would be a
+    /// driver-level use-after-free. In that case the
+    /// [`TransferProtocol::unconfirmed`] flag is
+    /// set: every destruction path (buffer drop, device teardown) then
+    /// quiesces before destroying — or leaks. (Reviews r2+r3 P1.)
+    fn one_shot_transfer(
+        &self,
+        queue: vk::Queue,
+        record: impl FnOnce(vk::CommandBuffer),
+    ) -> std::result::Result<(), (DeviceError, bool)> {
+        unsafe {
+            let alloc_info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(self.command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            let cmd = match self.device.allocate_command_buffers(&alloc_info) {
+                Ok(cmds) => cmds[0],
+                Err(e) => {
+                    return Err((
+                        DeviceError::BufferCreationFailed {
+                            message: format!("transfer allocate: {e}"),
+                        },
+                        false,
+                    ));
+                }
+            };
+
+            let begin_info = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            if let Err(e) = self.device.begin_command_buffer(cmd, &begin_info) {
+                // Never submitted: the command buffer is not pending and may
+                // be freed (closes the r1 P3 cb-retention follow-up for the
+                // pre-submit failure paths).
+                self.device.free_command_buffers(self.command_pool, &[cmd]);
+                return Err((
+                    DeviceError::BufferCreationFailed {
+                        message: format!("transfer begin: {e}"),
+                    },
+                    false,
+                ));
             }
-        })?[0];
 
-        let begin_info = vk::CommandBufferBeginInfo::default()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        device.begin_command_buffer(cmd, &begin_info).map_err(|e| {
-            DeviceError::BufferCreationFailed {
-                message: format!("transfer begin: {e}"),
+            record(cmd);
+
+            if let Err(e) = self.device.end_command_buffer(cmd) {
+                self.device.free_command_buffers(self.command_pool, &[cmd]);
+                return Err((
+                    DeviceError::BufferCreationFailed {
+                        message: format!("transfer end: {e}"),
+                    },
+                    false,
+                ));
             }
-        })?;
 
-        record(cmd);
+            let submit_info = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
+            if let Err(e) = self.device.queue_submit(
+                queue,
+                std::slice::from_ref(&submit_info),
+                vk::Fence::null(),
+            ) {
+                self.device.free_command_buffers(self.command_pool, &[cmd]);
+                return Err((
+                    DeviceError::BufferCreationFailed {
+                        message: format!("transfer submit: {e}"),
+                    },
+                    false,
+                ));
+            }
 
-        device
-            .end_command_buffer(cmd)
-            .map_err(|e| DeviceError::BufferCreationFailed {
-                message: format!("transfer end: {e}"),
-            })?;
+            // From here the command buffer is pending: it must NOT be freed
+            // on the failure path below — only the pool's destruction (or a
+            // later successful wait) can release it.
+            if let Err(e) = self.device.queue_wait_idle(queue) {
+                // Submission reached the GPU; its completion is unconfirmed.
+                // Destruction paths must now quiesce-or-leak (r3 P1s).
+                self.protocol
+                    .unconfirmed
+                    .store(true, std::sync::atomic::Ordering::Release);
+                return Err((
+                    DeviceError::BufferCreationFailed {
+                        message: format!("transfer wait: {e}"),
+                    },
+                    true,
+                ));
+            }
 
-        let submit_info = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
-        device
-            .queue_submit(queue, std::slice::from_ref(&submit_info), vk::Fence::null())
-            .map_err(|e| DeviceError::BufferCreationFailed {
-                message: format!("transfer submit: {e}"),
-            })?;
-        device
-            .queue_wait_idle(queue)
-            .map_err(|e| DeviceError::BufferCreationFailed {
-                message: format!("transfer wait: {e}"),
-            })?;
+            self.device.free_command_buffers(self.command_pool, &[cmd]);
+            Ok(())
+        }
+    }
 
-        device.free_command_buffers(command_pool, std::slice::from_ref(&cmd));
-        Ok(())
+    /// Best-effort quiesce before destroying resources a possibly-pending
+    /// submission may still touch — SERIALIZED with submissions through
+    /// the shared protocol lock (a lock-free quiesce could clear a taint
+    /// a concurrent submitter had just set, or overlap `device_wait_idle`
+    /// with an in-flight submit; reviews r4 P1s). Returns `true` when
+    /// destruction is safe; `false` means the caller MUST leak rather
+    /// than destroy.
+    ///
+    /// **Scope:** this resolves only the substrate's TRANSFER taint —
+    /// a submission Zunesha itself recorded whose wait failed. It does
+    /// NOT retire consumer submissions (with_compute_queue closures are
+    /// expected to complete their waits before returning) and does NOT
+    /// exclude queues the consumer may have acquired outside the
+    /// substrate (raw-handle unsafe use). Callers destroying resources
+    /// touched by such work must handle that retirement themselves
+    /// (review r5 P3).
+    pub fn quiesce_for_teardown(&self) -> bool {
+        self.protocol.quiesce(&self.device)
     }
 }
 
@@ -528,6 +630,130 @@ fn align_up(value: vk::DeviceSize, alignment: vk::DeviceSize) -> vk::DeviceSize 
 /// Internal state for a Vulkan buffer, stored behind the opaque `Buffer.raw`
 /// pointer. Self-contained: clones the device handle so it can destroy itself
 /// on drop. (ash `Device` does not auto-destroy on Drop, so the clone is safe.)
+/// The submission/teardown protocol shared by the device and every
+/// buffer inner: the compute-queue/transfer-pool `submit_lock` (all
+/// submissions AND all quiesces serialize through it — a quiesce's
+/// load→wait→clear must be atomic with respect to new submissions, or a
+/// lost-taint race lets a later destroy race a pending transfer) and the
+/// `unconfirmed` flag (a submission reached the GPU but its wait failed).
+/// (Reviews r2–r4 P1s.)
+struct TransferProtocol {
+    unconfirmed: std::sync::atomic::AtomicBool,
+    submit_lock: std::sync::Mutex<()>,
+    /// Unique identity for per-protocol reentrancy tracking (r6 P1: a
+    /// thread-local depth keyed only by THREAD would let a thread
+    /// holding device1's protocol skip device2's lock on a nested
+    /// entry — losing cross-device exclusion).
+    id: u64,
+}
+
+static PROTOCOL_IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    /// Per-thread nesting depth inside [`VulkanDevice::with_compute_queue`]
+    /// (or the substrate's internal submission paths), keyed BY PROTOCOL
+    /// ID (r6 P1: thread-global depth loses cross-device exclusion).
+    /// `depth(protocol) > 0` ⇒ this thread holds THAT protocol's
+    /// `submit_lock`, so BOTH a nested entry of the SAME protocol (the
+    /// substrate's own device-local staging transfer) and a quiesce
+    /// reached re-entrantly (a buffer dropping at closure end) skip the
+    /// non-reentrant re-acquisition — the cross-thread mutual exclusion
+    /// it exists to provide is already held by this thread. Entry of a
+    /// DIFFERENT protocol (another device) still acquires normally.
+    /// (Reviews r5+r6 P1s; nested-entry deadlock pre-existing since 0.1.1.)
+    static PROTOCOL_DEPTH: std::cell::RefCell<std::collections::HashMap<u64, u32>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+impl TransferProtocol {
+    /// This thread's nesting depth in THIS protocol (0 ⇒ not held).
+    fn held_by_current_thread(&self) -> bool {
+        PROTOCOL_DEPTH.with(|m| m.borrow().get(&self.id).is_some_and(|&d| d > 0))
+    }
+
+    /// Enter the protocol on this thread: acquire the cross-thread lock
+    /// unless this thread already holds it (per-protocol reentrancy),
+    /// then record the nesting. The `Pop` guard unwinds the record
+    /// BEFORE the lock releases, preserving the invariant above.
+    fn enter<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _guard = if self.held_by_current_thread() {
+            None
+        } else {
+            Some(
+                self.submit_lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )
+        };
+        PROTOCOL_DEPTH.with(|m| {
+            let mut m = m.borrow_mut();
+            *m.entry(self.id).or_insert(0) += 1;
+        });
+        struct Pop(u64);
+        impl Drop for Pop {
+            fn drop(&mut self) {
+                PROTOCOL_DEPTH.with(|m| {
+                    let mut m = m.borrow_mut();
+                    match m.get_mut(&self.0) {
+                        Some(d) if *d > 1 => *d -= 1,
+                        Some(_) => {
+                            m.remove(&self.0);
+                        }
+                        None => {}
+                    }
+                });
+            }
+        }
+        let _pop = Pop(self.id);
+        f()
+    }
+
+    /// Quiesce-or-leak, SERIALIZED with submissions via `submit_lock`.
+    /// Returns `true` when destruction is safe (no unconfirmed
+    /// submission, or `device_wait_idle` succeeded — which also clears
+    /// the flag under the lock, so a concurrent taint cannot be lost);
+    /// `false` when the wait failed again — the caller MUST leak rather
+    /// than destroy (persistent host-OOM or device loss are
+    /// indistinguishable here; leaking is sound for both).
+    ///
+    /// **Scope:** this resolves only the substrate's TRANSFER taint.
+    /// Consumer retirement (all non-Zunesha submissions completed before
+    /// the last handle drops) and exclusion of other queues remain
+    /// prerequisites of the caller (review r5 P3).
+    fn quiesce(&self, device: &ash::Device) -> bool {
+        use std::sync::atomic::Ordering;
+        // Reentrancy: if this thread already holds THIS protocol's
+        // submit_lock (nested entry), acquiring it again would deadlock
+        // (std's Mutex is not reentrant), and no other thread can submit
+        // on it meanwhile, so the load→wait→clear atomicity holds
+        // without the re-acquisition. A DIFFERENT protocol's depth does
+        // NOT exempt this one (r6 P1).
+        // Poison-steal: teardown must proceed after a submitter panicked.
+        let _guard = if self.held_by_current_thread() {
+            None
+        } else {
+            Some(
+                self.submit_lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )
+        };
+        if !self.unconfirmed.load(Ordering::Acquire) {
+            return true;
+        }
+        match unsafe { device.device_wait_idle() } {
+            Ok(()) => {
+                // Holding submit_lock: no submission can have started
+                // since the load, so the wait retired everything the flag
+                // could refer to — the clear cannot lose a taint.
+                self.unconfirmed.store(false, Ordering::Release);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
 struct VulkanBufferInner {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
@@ -542,6 +768,10 @@ struct VulkanBufferInner {
     staging_memory: Option<vk::DeviceMemory>,
     /// Clone of the logical device, used for destroy in drop.
     device: ash::Device,
+    /// Shared with the device: carries the submission lock and the
+    /// unconfirmed-submission flag — destruction quiesces through it or
+    /// leaks (reviews r3+r4 P1s).
+    protocol: std::sync::Arc<TransferProtocol>,
 }
 
 unsafe impl Send for VulkanBufferInner {}
@@ -549,6 +779,19 @@ unsafe impl Sync for VulkanBufferInner {}
 
 impl Drop for VulkanBufferInner {
     fn drop(&mut self) {
+        // Reviews r3+r4 P1s (readback path): if a submission touching this
+        // buffer is UNCONFIRMED (submit succeeded, wait failed), the GPU's
+        // access is indeterminate — destroying now would be a driver-level
+        // use-after-free. Quiesce SERIALIZED with submissions (the shared
+        // protocol lock); on a second wait failure leak rather than
+        // destroy (sound for both persistent host-OOM and device loss,
+        // which cannot be distinguished here).
+        if !self.protocol.quiesce(&self.device) {
+            eprintln!(
+                "zunesha: leaking buffer — a submission is unconfirmed and the device will not quiesce"
+            );
+            return;
+        }
         // Safety: the buffer owns its resources exclusively; `free_memory`
         // implicitly unmaps any mapped memory. The device handle is valid
         // because buffers must not outlive the device (documented invariant).
@@ -602,10 +845,12 @@ pub struct VulkanDevice {
     /// Serializes every submission to the shared compute queue and every
     /// use of `command_pool` — both are *externally synchronized* Vulkan
     /// objects (one host thread at a time, spec §7). The substrate's own
-    /// staging transfers and consumer submissions
-    /// ([`with_compute_queue`](VulkanDevice::with_compute_queue)) take this
-    /// lock, which is what makes `Send + Sync` sound (review round 1, P1).
-    submit_lock: std::sync::Mutex<()>,
+    /// staging transfers, consumer submissions
+    /// ([`with_compute_queue`](VulkanDevice::with_compute_queue)), AND
+    /// teardown quiesces serialize through this lock (shared with buffer
+    /// inners via [`TransferProtocol`]), which is what makes
+    /// `Send + Sync` sound (reviews r1+r4 P1s).
+    protocol: std::sync::Arc<TransferProtocol>,
     memory_properties: vk::PhysicalDeviceMemoryProperties,
     memory_strategy: MemoryStrategy,
     /// Effective memory placement: device-local (VRAM) vs host-visible.
@@ -630,6 +875,17 @@ impl Drop for VulkanDevice {
             unsafe {
                 self.device.device_wait_idle().ok();
             }
+        }
+        // Review r3 P1 (teardown path): a retained one-shot transfer whose
+        // wait failed leaves a PENDING command buffer in this pool —
+        // destroying the pool would be UB. Quiesce best-effort; if the
+        // device will not quiesce, leak everything (sound for persistent
+        // host-OOM and device loss alike, which cannot be distinguished).
+        if !self.quiesce_for_teardown() {
+            eprintln!(
+                "zunesha: leaking device teardown — a submission is unconfirmed and the device will not quiesce"
+            );
+            return;
         }
         // Safety: command pool before device before instance (Vulkan order).
         // Buffers must already have been dropped by the caller (documented
@@ -762,7 +1018,11 @@ impl VulkanDevice {
             uses_device_local,
             limits,
             epoch: GpuEpochTracker::new(),
-            submit_lock: std::sync::Mutex::new(()),
+            protocol: std::sync::Arc::new(TransferProtocol {
+                unconfirmed: std::sync::atomic::AtomicBool::new(false),
+                submit_lock: std::sync::Mutex::new(()),
+                id: PROTOCOL_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            }),
         })
     }
 
@@ -807,19 +1067,37 @@ impl VulkanDevice {
             let (dev_buf, dev_mem) = unsafe {
                 allocate_device_local_buffer(&self.device, &self.memory_properties, aligned, usage)?
             };
-            let (stg_buf, stg_mem, stg_mapped) = unsafe {
+            // Review (Borsalino PR #60 r1, substrate half): if the staging
+            // allocation fails, free the device allocation before
+            // propagating — the owning inner does not exist yet.
+            let (stg_buf, stg_mem, stg_mapped) = match unsafe {
                 allocate_buffer(
                     &self.device,
                     &self.memory_properties,
                     aligned,
                     vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
-                )?
+                )
+            } {
+                Ok(alloc) => alloc,
+                Err(e) => {
+                    unsafe {
+                        self.device.destroy_buffer(dev_buf, None);
+                        self.device.free_memory(dev_mem, None);
+                    }
+                    return Err(e);
+                }
             };
             if let Some(src) = data {
                 if byte_len > 0 {
                     unsafe { ptr::copy_nonoverlapping(src, stg_mapped, byte_len as usize) };
-                    self.with_compute_queue(|queue| unsafe {
-                        one_shot_transfer(&self.device, self.command_pool, queue, |cmd| {
+                    // Failure discipline: reclaim BOTH allocations only
+                    // when nothing reached the GPU (review r1: propagate
+                    // the original error; review r2 P1: a failed wait
+                    // after a successful submit leaves the GPU's access
+                    // indeterminate — destroying would be a driver-level
+                    // use-after-free, so that case deliberately leaks).
+                    if let Err((e, submitted)) = self.with_compute_queue(|queue| unsafe {
+                        self.one_shot_transfer(queue, |cmd| {
                             let copy = vk::BufferCopy::default().size(aligned);
                             self.device.cmd_copy_buffer(
                                 cmd,
@@ -828,7 +1106,17 @@ impl VulkanDevice {
                                 std::slice::from_ref(&copy),
                             );
                         })
-                    })?;
+                    }) {
+                        if !submitted {
+                            unsafe {
+                                self.device.destroy_buffer(stg_buf, None);
+                                self.device.free_memory(stg_mem, None);
+                                self.device.destroy_buffer(dev_buf, None);
+                                self.device.free_memory(dev_mem, None);
+                            }
+                        }
+                        return Err(e);
+                    }
                 }
             }
             (dev_buf, dev_mem, stg_mapped, Some(stg_buf), Some(stg_mem))
@@ -852,6 +1140,7 @@ impl VulkanDevice {
             staging_buffer,
             staging_memory,
             device: self.device.clone(),
+            protocol: std::sync::Arc::clone(&self.protocol),
         });
         Ok(crate::Buffer {
             raw: Box::into_raw(inner) as *mut c_void,
@@ -929,14 +1218,11 @@ impl VulkanDevice {
     /// The lock is held only for the closure's duration; it is never held
     /// across a long-running GPU wait started elsewhere.
     pub fn with_compute_queue<R>(&self, f: impl FnOnce(vk::Queue) -> R) -> R {
-        // Poisoning only means a submitter panicked mid-closure; the queue
-        // state is still usable (Vulkan object state is not corrupted by a
-        // host panic between calls), so steal the lock and continue.
-        let _guard = self
-            .submit_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        f(self.compute_queue)
+        // Per-protocol reentrancy + cross-thread exclusion live in
+        // [`TransferProtocol::enter`] (reviews r5+r6 P1s: same-device
+        // nested entry must not deadlock; another device's lock must
+        // still be acquired).
+        self.protocol.enter(|| f(self.compute_queue))
     }
 }
 
@@ -1033,7 +1319,7 @@ impl Device for VulkanDevice {
         // staging race — and still take the lock for uniformity.
         self.with_compute_queue(|queue| unsafe {
             if let Some(stg_buf) = inner.staging_buffer {
-                one_shot_transfer(&self.device, self.command_pool, queue, |cmd| {
+                self.one_shot_transfer(queue, |cmd| {
                     let copy = vk::BufferCopy::default().size(inner.size);
                     self.device.cmd_copy_buffer(
                         cmd,
@@ -1041,7 +1327,8 @@ impl Device for VulkanDevice {
                         stg_buf,
                         std::slice::from_ref(&copy),
                     );
-                })?;
+                })
+                .map_err(|(e, _)| e)?;
             }
             let src = inner.mapped as *const T;
             let slice = std::slice::from_raw_parts(src, count);
@@ -1300,6 +1587,101 @@ mod tests {
     /// 1's P1, with the readback copy inside the lock per round 2's).
     /// Regression: concurrent device-local buffer creation + readback from
     /// four threads round-trips exactly and does not deadlock.
+    /// Review r5 P1 regression: a buffer dropped INSIDE a
+    /// with_compute_queue closure must not deadlock the non-reentrant
+    /// submit lock (its Drop quiesce skips the re-acquisition because
+    /// this thread already holds the protocol). Timeout-guarded so a
+    /// regression FAILS rather than hangs.
+    /// Review r6 P1 regression: reentrancy must be keyed per PROTOCOL
+    /// (device), not per thread — a thread holding device1's protocol
+    /// must NOT skip device2's lock on a nested entry. Deterministic:
+    /// thread B holds d2's protocol and parks; thread A (inside d1's
+    /// closure) enters d2's closure — it must BLOCK until B releases.
+    /// A global depth marker would let A enter concurrently (the bug).
+    #[test]
+    #[serial]
+    fn nested_cross_device_entry_still_excludes() {
+        let d1 = match VulkanDevice::init() {
+            Ok(d) => std::sync::Arc::new(d),
+            Err(e) => {
+                eprintln!("skipping: no Vulkan device ({e})");
+                return;
+            }
+        };
+        let d2 = match VulkanDevice::init() {
+            Ok(d) => std::sync::Arc::new(d),
+            Err(e) => {
+                eprintln!("skipping: second device init ({e})");
+                return;
+            }
+        };
+
+        let (b_entered_tx, b_entered_rx) = std::sync::mpsc::channel::<()>();
+        let (b_release_tx, b_release_rx) = std::sync::mpsc::channel::<()>();
+        let (a_done_tx, a_done_rx) = std::sync::mpsc::channel::<()>();
+
+        let db = std::sync::Arc::clone(&d2);
+        let holder = std::thread::spawn(move || {
+            db.with_compute_queue(|_| {
+                b_entered_tx.send(()).unwrap();
+                let _ = b_release_rx.recv(); // hold d2's protocol open
+            });
+        });
+        b_entered_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("holder failed to enter d2");
+
+        let (da, db2) = (std::sync::Arc::clone(&d1), std::sync::Arc::clone(&d2));
+        let racer = std::thread::spawn(move || {
+            da.with_compute_queue(|_| {
+                db2.with_compute_queue(|_| ());
+            });
+            a_done_tx.send(()).unwrap();
+        });
+
+        // The racer must still be BLOCKED on d2's lock while the holder
+        // keeps it: a completed entry here is the lost-exclusion bug.
+        assert!(
+            a_done_rx
+                .recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "nested cross-device entry skipped device2's lock (reentrancy not per-protocol)"
+        );
+        b_release_tx.send(()).unwrap();
+        assert!(
+            a_done_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .is_ok(),
+            "racer did not enter d2 after the holder released"
+        );
+        holder.join().unwrap();
+        racer.join().unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn buffer_drop_inside_with_compute_queue_does_not_deadlock() {
+        let device = match VulkanDevice::init() {
+            Ok(d) => std::sync::Arc::new(d),
+            Err(e) => {
+                eprintln!("skipping: no Vulkan device ({e})");
+                return;
+            }
+        };
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let d = std::sync::Arc::clone(&device);
+        let handle = std::thread::spawn(move || {
+            d.with_compute_queue(|_| {
+                let buf = d.create_buffer(&[1.0f32, 2.0, 3.0, 4.0]).unwrap();
+                drop(buf); // re-entrant quiesce — used to deadlock here
+            });
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("closure deadlocked dropping a buffer inside with_compute_queue");
+        handle.join().unwrap();
+    }
+
     #[test]
     #[serial]
     fn concurrent_buffer_creation_is_serialized() {
