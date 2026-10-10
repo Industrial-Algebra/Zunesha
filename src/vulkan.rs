@@ -581,6 +581,15 @@ impl VulkanDevice {
     /// with an in-flight submit; reviews r4 P1s). Returns `true` when
     /// destruction is safe; `false` means the caller MUST leak rather
     /// than destroy.
+    ///
+    /// **Scope:** this resolves only the substrate's TRANSFER taint —
+    /// a submission Zunesha itself recorded whose wait failed. It does
+    /// NOT retire consumer submissions (with_compute_queue closures are
+    /// expected to complete their waits before returning) and does NOT
+    /// exclude queues the consumer may have acquired outside the
+    /// substrate (raw-handle unsafe use). Callers destroying resources
+    /// touched by such work must handle that retirement themselves
+    /// (review r5 P3).
     pub fn quiesce_for_teardown(&self) -> bool {
         self.protocol.quiesce(&self.device)
     }
@@ -633,6 +642,18 @@ struct TransferProtocol {
     submit_lock: std::sync::Mutex<()>,
 }
 
+thread_local! {
+    /// Per-thread nesting depth inside [`VulkanDevice::with_compute_queue`]
+    /// (or the substrate's internal submission paths). `> 0` ⇒ this thread
+    /// holds `submit_lock`, so BOTH a nested protocol entry (the
+    /// substrate's own device-local staging transfer) and a quiesce
+    /// reached re-entrantly (a buffer dropping at closure end) skip
+    /// re-acquiring the non-reentrant mutex — the cross-thread mutual
+    /// exclusion it exists to provide is already held by this thread
+    /// (review r5 P1; nested-entry deadlock pre-existing since 0.1.1).
+    static PROTOCOL_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 impl TransferProtocol {
     /// Quiesce-or-leak, SERIALIZED with submissions via `submit_lock`.
     /// Returns `true` when destruction is safe (no unconfirmed
@@ -641,13 +662,29 @@ impl TransferProtocol {
     /// `false` when the wait failed again — the caller MUST leak rather
     /// than destroy (persistent host-OOM or device loss are
     /// indistinguishable here; leaking is sound for both).
+    ///
+    /// **Scope:** this resolves only the substrate's TRANSFER taint.
+    /// Consumer retirement (all non-Zunesha submissions completed before
+    /// the last handle drops) and exclusion of other queues remain
+    /// prerequisites of the caller (review r5 P3).
     fn quiesce(&self, device: &ash::Device) -> bool {
         use std::sync::atomic::Ordering;
+        // Reentrancy: if this thread is inside with_compute_queue it
+        // already holds submit_lock — acquiring it again would deadlock
+        // (std's Mutex is not reentrant), and no other thread can submit
+        // meanwhile, so the load→wait→clear atomicity holds without the
+        // re-acquisition.
+        let reentrant = PROTOCOL_DEPTH.get() > 0;
         // Poison-steal: teardown must proceed after a submitter panicked.
-        let _guard = self
-            .submit_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = if reentrant {
+            None
+        } else {
+            Some(
+                self.submit_lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )
+        };
         if !self.unconfirmed.load(Ordering::Acquire) {
             return true;
         }
@@ -1127,14 +1164,38 @@ impl VulkanDevice {
     /// The lock is held only for the closure's duration; it is never held
     /// across a long-running GPU wait started elsewhere.
     pub fn with_compute_queue<R>(&self, f: impl FnOnce(vk::Queue) -> R) -> R {
-        // Poisoning only means a submitter panicked mid-closure; the queue
-        // state is still usable (Vulkan object state is not corrupted by a
-        // host panic between calls), so steal the lock and continue.
-        let _guard = self
-            .protocol
-            .submit_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The lock's purpose is CROSS-THREAD exclusion of the shared
+        // queue/pool; this thread re-entering the protocol must NOT
+        // re-acquire the non-reentrant mutex. Re-entry is real and
+        // pre-existing since 0.1.1: the substrate's own buffer creation
+        // (device-local staging transfer) and a buffer's teardown quiesce
+        // both run inside a consumer's closure (found via review r5 P1's
+        // reproduction). PROTOCOL_DEPTH > 0 ⇒ this thread already holds
+        // submit_lock.
+        let _guard = if PROTOCOL_DEPTH.get() > 0 {
+            None
+        } else {
+            // Poisoning only means a submitter panicked mid-closure; the
+            // queue state is still usable (Vulkan object state is not
+            // corrupted by a host panic between calls), so steal the lock
+            // and continue.
+            Some(
+                self.protocol
+                    .submit_lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )
+        };
+        // Depth resets on unwind via Drop, BEFORE any held lock releases,
+        // keeping the invariant "depth > 0 ⇒ this thread holds the lock".
+        struct DepthReset;
+        impl Drop for DepthReset {
+            fn drop(&mut self) {
+                PROTOCOL_DEPTH.set(PROTOCOL_DEPTH.get().saturating_sub(1));
+            }
+        }
+        PROTOCOL_DEPTH.set(PROTOCOL_DEPTH.get() + 1);
+        let _depth = DepthReset;
         f(self.compute_queue)
     }
 }
@@ -1500,6 +1561,35 @@ mod tests {
     /// 1's P1, with the readback copy inside the lock per round 2's).
     /// Regression: concurrent device-local buffer creation + readback from
     /// four threads round-trips exactly and does not deadlock.
+    /// Review r5 P1 regression: a buffer dropped INSIDE a
+    /// with_compute_queue closure must not deadlock the non-reentrant
+    /// submit lock (its Drop quiesce skips the re-acquisition because
+    /// this thread already holds the protocol). Timeout-guarded so a
+    /// regression FAILS rather than hangs.
+    #[test]
+    #[serial]
+    fn buffer_drop_inside_with_compute_queue_does_not_deadlock() {
+        let device = match VulkanDevice::init() {
+            Ok(d) => std::sync::Arc::new(d),
+            Err(e) => {
+                eprintln!("skipping: no Vulkan device ({e})");
+                return;
+            }
+        };
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let d = std::sync::Arc::clone(&device);
+        let handle = std::thread::spawn(move || {
+            d.with_compute_queue(|_| {
+                let buf = d.create_buffer(&[1.0f32, 2.0, 3.0, 4.0]).unwrap();
+                drop(buf); // re-entrant quiesce — used to deadlock here
+            });
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("closure deadlocked dropping a buffer inside with_compute_queue");
+        handle.join().unwrap();
+    }
+
     #[test]
     #[serial]
     fn concurrent_buffer_creation_is_serialized() {

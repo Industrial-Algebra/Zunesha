@@ -30,6 +30,19 @@ step now frees what was created before it propagates:
   overlap `device_wait_idle` with in-flight queue use); the lock and
   flag ship as one shared `TransferProtocol` Arc held by the device
   and every buffer inner.
+
+### Fixed — protocol reentrancy (2026-10-10)
+
+- `with_compute_queue` is reentrant per THREAD (r5 P1 + a pre-existing
+  deadlock found by its reproduction): the submit lock provides
+  cross-THREAD exclusion only, so nested protocol entry on the holding
+  thread — the substrate's own device-local staging transfer during
+  `create_buffer`/`create_device_buffer` inside a consumer closure
+  (deadlocked since 0.1.1), and a buffer's teardown quiesce when the
+  buffer drops at closure end — skips the non-reentrant re-acquisition
+  via a thread-local depth marker. Regression:
+  `buffer_drop_inside_with_compute_queue_does_not_deadlock`
+  (timeout-guarded, RTX 5080).
 - `allocate_buffer`: memory-type lookup, `vkAllocateMemory`,
   `vkBindBufferMemory`, and `vkMapMemory` failures destroy the buffer
   (and free the memory once allocated).
