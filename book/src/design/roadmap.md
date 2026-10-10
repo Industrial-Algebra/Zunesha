@@ -25,6 +25,12 @@
 
 ## Pending — committed sequence
 
+- [x] **Metal backend** (`objc`, macOS) — landed on `feat/metal-backend`:
+      ADR-0004 queue reinterpretation, Shared + Private/staging storage
+      modes, escape hatches, `ZUNESHA_REQUIRE_METAL` CI. Verified on
+      Apple M5 Max; ships with the next release. Unblocks Borsalino-Metal's
+      staged migration.
+
 - [ ] **Borsalino migration** — Borsalino consumes Zunesha, deletes its own
       epoch tracker + device layer. The substrate's reason to exist; makes
       ADR 0001 fully true. Requires exposing a consumer-callable
@@ -35,11 +41,10 @@
 ## Speculative — bannered
 
 > Not scheduled. Each lands only with a concrete consumer need, per ADR
-> 0001's reversibility clause.
+> 0001's reversibility clause. (The Metal backend moved out of this
+> section — see Pending above.)
 
-- [ ] **Metal backend** (`objc`, macOS) — substrate-first sequencing applies:
-      nothing consumes it until Goldenweek-Metal exists.
-- [ ] **Cross-queue synchronization** (candidate ADR 0004) — queue-family
+- [ ] **Cross-queue synchronization** (candidate ADR 0005) — queue-family
       release/acquire (or timeline semaphores) for `EXCLUSIVE` buffers
       crossing compute↔graphics families. Unowned today; safe only while
       everything is host-synchronous (the 09-02 rabbit hole's "who orders

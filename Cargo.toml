@@ -29,7 +29,7 @@ bytemuck = { version = "1", features = ["derive"] }
 # device + queues + memory + buffer layer.
 #
 # Backend dependencies are reintroduced alongside src/metal.rs / src/vulkan.rs.
-# Vulkan is live from this release; Metal still pending.
+# Both live: Vulkan (Linux/Windows) since v0.1, Metal (macOS) on this branch.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc = { version = "0.2", optional = true } # raw objc_msgSend FFI (Metal backend)
 
