@@ -39,14 +39,16 @@
 //!
 //! ## Backends
 //!
-//! | Feature  | Platform       | Status (v0.1)                                    |
-//! |----------|----------------|--------------------------------------------------|
-//! | `metal`  | macOS          | 🚧 Trait + stub only                             |
-//! | `vulkan` | Linux, Windows | ✅ Device, queues, host-visible + device-local   |
+//! | Feature  | Platform       | Status                                            |
+//! |----------|----------------|---------------------------------------------------|
+//! | `metal`  | macOS          | ✅ Device, queues, Shared + Private/staging        |
+//! | `vulkan` | Linux, Windows | ✅ Device, queues, host-visible + device-local    |
 //!
-//! v0.1 ships the [`Device`] trait, the [`Buffer`] / queue / quiescence types,
-//! the ported [`epoch`] tracker, and a [`NoDeviceStub`]. The Vulkan backend is
-//! the first target (mirroring Borsalino/Goldenweek's development order).
+//! v0.1 shipped the [`Device`] trait, the [`Buffer`] / queue / quiescence
+//! types, the ported [`epoch`] tracker, a [`NoDeviceStub`], and the Vulkan
+//! backend (verified on NVIDIA RTX 5080, Intel ARL/Mesa, AMD Phoenix1/RADV,
+//! llvmpipe). The Metal backend lands post-v0.1 (ADR 0004), verified on
+//! Apple M5 Max.
 //!
 //! ## Status
 //!
@@ -555,7 +557,7 @@ impl Device for NoDeviceStub {
 /// Never requires a graphics queue — Borsalino-safe on compute-only hardware.
 ///
 /// - Linux / Windows: `vulkan::VulkanDevice` (requires `vulkan` feature)
-/// - macOS: `metal::MetalDevice` (requires `metal` feature) — not yet implemented
+/// - macOS: `metal::MetalDevice` (requires `metal` feature)
 /// - Otherwise: [`DeviceError::NoDevice`]
 #[cfg(all(feature = "vulkan", not(target_os = "macos")))]
 pub fn init() -> Result<vulkan::VulkanDevice> {
@@ -576,14 +578,40 @@ pub fn init_with(request: InitRequest) -> Result<vulkan::VulkanDevice> {
     vulkan::VulkanDevice::init_with(request)
 }
 
+/// Initialise the best available device (Metal backend, macOS).
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub fn init() -> Result<metal::MetalDevice> {
+    metal::MetalDevice::init()
+}
+
+/// Initialise with an explicit memory strategy (Metal backend, macOS).
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub fn init_with_strategy(strategy: MemoryStrategy) -> Result<metal::MetalDevice> {
+    metal::MetalDevice::init_with_strategy(strategy)
+}
+
+/// Initialise with explicit capability preferences (Metal backend, macOS).
+///
+/// See [`InitRequest`] and [`Device::init_with`].
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub fn init_with(request: InitRequest) -> Result<metal::MetalDevice> {
+    metal::MetalDevice::init_with(request)
+}
+
 /// Initialise the best available device — fallback when no backend is compiled.
-#[cfg(not(all(feature = "vulkan", not(target_os = "macos"))))]
+#[cfg(not(any(
+    all(feature = "vulkan", not(target_os = "macos")),
+    all(feature = "metal", target_os = "macos")
+)))]
 pub fn init() -> Result<NoDeviceStub> {
     Err(DeviceError::NoDevice)
 }
 
 /// Initialise with an explicit memory strategy — fallback (no backend).
-#[cfg(not(all(feature = "vulkan", not(target_os = "macos"))))]
+#[cfg(not(any(
+    all(feature = "vulkan", not(target_os = "macos")),
+    all(feature = "metal", target_os = "macos")
+)))]
 pub fn init_with_strategy(_strategy: MemoryStrategy) -> Result<NoDeviceStub> {
     Err(DeviceError::NoDevice)
 }
@@ -591,7 +619,10 @@ pub fn init_with_strategy(_strategy: MemoryStrategy) -> Result<NoDeviceStub> {
 /// Initialise with explicit capability preferences — fallback (no backend).
 ///
 /// See [`InitRequest`] and [`Device::init_with`].
-#[cfg(not(all(feature = "vulkan", not(target_os = "macos"))))]
+#[cfg(not(any(
+    all(feature = "vulkan", not(target_os = "macos")),
+    all(feature = "metal", target_os = "macos")
+)))]
 pub fn init_with(_request: InitRequest) -> Result<NoDeviceStub> {
     Err(DeviceError::NoDevice)
 }
@@ -675,7 +706,28 @@ mod tests {
             let _ = init_with(InitRequest::prefer_graphics());
         }
 
-        #[cfg(not(all(feature = "vulkan", not(target_os = "macos"))))]
+        // On macOS with the metal feature, the top-level initialisers must
+        // resolve to `metal::MetalDevice` — a compile-time fact, asserted
+        // by their signatures; at runtime a real device is expected (the
+        // REQUIRE-METAL pattern keeps dedicated hardware CI honest).
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        {
+            let _resolve_check: fn() -> Result<metal::MetalDevice> = init;
+            match init() {
+                Ok(d) => assert!(!d.queues().compute.raw.is_null()),
+                Err(e) => assert!(
+                    std::env::var("ZUNESHA_REQUIRE_METAL").is_err(),
+                    "ZUNESHA_REQUIRE_METAL is set but top-level init failed: {e}"
+                ),
+            }
+            let _ = init_with_strategy(MemoryStrategy::Unified);
+            let _ = init_with(InitRequest::prefer_graphics());
+        }
+
+        #[cfg(not(any(
+            all(feature = "vulkan", not(target_os = "macos")),
+            all(feature = "metal", target_os = "macos")
+        )))]
         {
             assert!(matches!(init(), Err(DeviceError::NoDevice)));
             assert!(matches!(
