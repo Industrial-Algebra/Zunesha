@@ -476,83 +476,122 @@ unsafe fn allocate_device_local_buffer(
 /// permits e.g. host-OOM from the wait; it is neither proof of device
 /// loss nor of completion), so reclaiming them would be a driver-level
 /// use-after-free. The sound side is to leak (review r2 P1).
-unsafe fn one_shot_transfer(
-    device: &ash::Device,
-    command_pool: vk::CommandPool,
-    queue: vk::Queue,
-    record: impl FnOnce(vk::CommandBuffer),
-) -> std::result::Result<(), (DeviceError, bool)> {
-    unsafe {
-        let alloc_info = vk::CommandBufferAllocateInfo::default()
-            .command_pool(command_pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        let cmd = match device.allocate_command_buffers(&alloc_info) {
-            Ok(cmds) => cmds[0],
-            Err(e) => {
+impl VulkanDevice {
+    /// One-shot transfer. The error's `bool` is **"submission reached the
+    /// GPU"**: `false` means nothing was submitted (allocate/begin/end/
+    /// submit failed — the recorded resources are untouched and safe to
+    /// reclaim); `true` means submission succeeded but the wait failed —
+    /// the GPU's access to the recorded resources is **indeterminate**
+    /// (the spec permits e.g. host-OOM from the wait; it is neither proof
+    /// of device loss nor of completion), so reclaiming them would be a
+    /// driver-level use-after-free. In that case the
+    /// [`unconfirmed_submission`](Self::unconfirmed_submission) flag is
+    /// set: every destruction path (buffer drop, device teardown) then
+    /// quiesces before destroying — or leaks. (Reviews r2+r3 P1.)
+    fn one_shot_transfer(
+        &self,
+        queue: vk::Queue,
+        record: impl FnOnce(vk::CommandBuffer),
+    ) -> std::result::Result<(), (DeviceError, bool)> {
+        unsafe {
+            let alloc_info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(self.command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            let cmd = match self.device.allocate_command_buffers(&alloc_info) {
+                Ok(cmds) => cmds[0],
+                Err(e) => {
+                    return Err((
+                        DeviceError::BufferCreationFailed {
+                            message: format!("transfer allocate: {e}"),
+                        },
+                        false,
+                    ));
+                }
+            };
+
+            let begin_info = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            if let Err(e) = self.device.begin_command_buffer(cmd, &begin_info) {
+                // Never submitted: the command buffer is not pending and may
+                // be freed (closes the r1 P3 cb-retention follow-up for the
+                // pre-submit failure paths).
+                self.device.free_command_buffers(self.command_pool, &[cmd]);
                 return Err((
                     DeviceError::BufferCreationFailed {
-                        message: format!("transfer allocate: {e}"),
+                        message: format!("transfer begin: {e}"),
                     },
                     false,
                 ));
             }
-        };
 
-        let begin_info = vk::CommandBufferBeginInfo::default()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        if let Err(e) = device.begin_command_buffer(cmd, &begin_info) {
-            // Never submitted: the command buffer is not pending and may
-            // be freed (closes the r1 P3 cb-retention follow-up for the
-            // pre-submit failure paths).
-            device.free_command_buffers(command_pool, &[cmd]);
-            return Err((
-                DeviceError::BufferCreationFailed {
-                    message: format!("transfer begin: {e}"),
-                },
-                false,
-            ));
+            record(cmd);
+
+            if let Err(e) = self.device.end_command_buffer(cmd) {
+                self.device.free_command_buffers(self.command_pool, &[cmd]);
+                return Err((
+                    DeviceError::BufferCreationFailed {
+                        message: format!("transfer end: {e}"),
+                    },
+                    false,
+                ));
+            }
+
+            let submit_info = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
+            if let Err(e) = self.device.queue_submit(
+                queue,
+                std::slice::from_ref(&submit_info),
+                vk::Fence::null(),
+            ) {
+                self.device.free_command_buffers(self.command_pool, &[cmd]);
+                return Err((
+                    DeviceError::BufferCreationFailed {
+                        message: format!("transfer submit: {e}"),
+                    },
+                    false,
+                ));
+            }
+
+            // From here the command buffer is pending: it must NOT be freed
+            // on the failure path below — only the pool's destruction (or a
+            // later successful wait) can release it.
+            if let Err(e) = self.device.queue_wait_idle(queue) {
+                // Submission reached the GPU; its completion is unconfirmed.
+                // Destruction paths must now quiesce-or-leak (r3 P1s).
+                self.unconfirmed_submission
+                    .store(true, std::sync::atomic::Ordering::Release);
+                return Err((
+                    DeviceError::BufferCreationFailed {
+                        message: format!("transfer wait: {e}"),
+                    },
+                    true,
+                ));
+            }
+
+            self.device.free_command_buffers(self.command_pool, &[cmd]);
+            Ok(())
         }
+    }
 
-        record(cmd);
-
-        if let Err(e) = device.end_command_buffer(cmd) {
-            device.free_command_buffers(command_pool, &[cmd]);
-            return Err((
-                DeviceError::BufferCreationFailed {
-                    message: format!("transfer end: {e}"),
-                },
-                false,
-            ));
+    /// Best-effort quiesce before destroying resources a possibly-pending
+    /// submission may still touch. Returns `true` when destruction is
+    /// safe (no unconfirmed submission, or the wait succeeded — which
+    /// also clears the flag); `false` when the wait failed again — the
+    /// caller MUST leak rather than destroy (a second wait failure is
+    /// pathological — persistent host-OOM, or device loss, which this
+    /// code cannot distinguish; leaking is sound for both).
+    pub fn quiesce_for_teardown(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        if !self.unconfirmed_submission.load(Ordering::Acquire) {
+            return true;
         }
-
-        let submit_info = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
-        if let Err(e) =
-            device.queue_submit(queue, std::slice::from_ref(&submit_info), vk::Fence::null())
-        {
-            device.free_command_buffers(command_pool, &[cmd]);
-            return Err((
-                DeviceError::BufferCreationFailed {
-                    message: format!("transfer submit: {e}"),
-                },
-                false,
-            ));
+        match unsafe { self.device.device_wait_idle() } {
+            Ok(()) => {
+                self.unconfirmed_submission.store(false, Ordering::Release);
+                true
+            }
+            Err(_) => false,
         }
-
-        // From here the command buffer is pending: it must NOT be freed
-        // on the failure path below — only the pool's destruction (or a
-        // later successful wait) can release it.
-        if let Err(e) = device.queue_wait_idle(queue) {
-            return Err((
-                DeviceError::BufferCreationFailed {
-                    message: format!("transfer wait: {e}"),
-                },
-                true,
-            ));
-        }
-
-        device.free_command_buffers(command_pool, &[cmd]);
-        Ok(())
     }
 }
 
@@ -605,6 +644,10 @@ struct VulkanBufferInner {
     staging_memory: Option<vk::DeviceMemory>,
     /// Clone of the logical device, used for destroy in drop.
     device: ash::Device,
+    /// Shared with the device: set when a submission's completion is
+    /// UNCONFIRMED (submit succeeded, wait failed). Destruction of these
+    /// resources must then quiesce first — or leak (review r3 P1s).
+    unconfirmed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 unsafe impl Send for VulkanBufferInner {}
@@ -612,6 +655,22 @@ unsafe impl Sync for VulkanBufferInner {}
 
 impl Drop for VulkanBufferInner {
     fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        // Review r3 P1 (readback path): if a submission touching this
+        // buffer is UNCONFIRMED (submit succeeded, wait failed), the GPU's
+        // access is indeterminate — destroying now would be a driver-level
+        // use-after-free. Best-effort quiesce; on a second wait failure
+        // leak rather than destroy (sound for both persistent host-OOM
+        // and device loss, which cannot be distinguished here).
+        if self.unconfirmed.load(Ordering::Acquire)
+            && unsafe { self.device.device_wait_idle() }.is_err()
+        {
+            eprintln!(
+                "zunesha: leaking buffer — a submission is unconfirmed and the device will not quiesce"
+            );
+            return;
+        }
+        self.unconfirmed.store(false, Ordering::Release);
         // Safety: the buffer owns its resources exclusively; `free_memory`
         // implicitly unmaps any mapped memory. The device handle is valid
         // because buffers must not outlive the device (documented invariant).
@@ -675,6 +734,12 @@ pub struct VulkanDevice {
     uses_device_local: bool,
     limits: DeviceLimits,
     epoch: GpuEpochTracker,
+    /// Set when a submission's completion is UNCONFIRMED (submit
+    /// succeeded, wait failed — the GPU's access to recorded resources
+    /// is then indeterminate). Destruction paths (buffer drop, device
+    /// teardown) must quiesce before destroying — or leak. See
+    /// [`one_shot_transfer`](VulkanDevice::one_shot_transfer).
+    unconfirmed_submission: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Drop for VulkanDevice {
@@ -693,6 +758,17 @@ impl Drop for VulkanDevice {
             unsafe {
                 self.device.device_wait_idle().ok();
             }
+        }
+        // Review r3 P1 (teardown path): a retained one-shot transfer whose
+        // wait failed leaves a PENDING command buffer in this pool —
+        // destroying the pool would be UB. Quiesce best-effort; if the
+        // device will not quiesce, leak everything (sound for persistent
+        // host-OOM and device loss alike, which cannot be distinguished).
+        if !self.quiesce_for_teardown() {
+            eprintln!(
+                "zunesha: leaking device teardown — a submission is unconfirmed and the device will not quiesce"
+            );
+            return;
         }
         // Safety: command pool before device before instance (Vulkan order).
         // Buffers must already have been dropped by the caller (documented
@@ -825,6 +901,7 @@ impl VulkanDevice {
             uses_device_local,
             limits,
             epoch: GpuEpochTracker::new(),
+            unconfirmed_submission: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             submit_lock: std::sync::Mutex::new(()),
         })
     }
@@ -900,7 +977,7 @@ impl VulkanDevice {
                     // indeterminate — destroying would be a driver-level
                     // use-after-free, so that case deliberately leaks).
                     if let Err((e, submitted)) = self.with_compute_queue(|queue| unsafe {
-                        one_shot_transfer(&self.device, self.command_pool, queue, |cmd| {
+                        self.one_shot_transfer(queue, |cmd| {
                             let copy = vk::BufferCopy::default().size(aligned);
                             self.device.cmd_copy_buffer(
                                 cmd,
@@ -943,6 +1020,7 @@ impl VulkanDevice {
             staging_buffer,
             staging_memory,
             device: self.device.clone(),
+            unconfirmed: std::sync::Arc::clone(&self.unconfirmed_submission),
         });
         Ok(crate::Buffer {
             raw: Box::into_raw(inner) as *mut c_void,
@@ -1124,7 +1202,7 @@ impl Device for VulkanDevice {
         // staging race — and still take the lock for uniformity.
         self.with_compute_queue(|queue| unsafe {
             if let Some(stg_buf) = inner.staging_buffer {
-                one_shot_transfer(&self.device, self.command_pool, queue, |cmd| {
+                self.one_shot_transfer(queue, |cmd| {
                     let copy = vk::BufferCopy::default().size(inner.size);
                     self.device.cmd_copy_buffer(
                         cmd,
