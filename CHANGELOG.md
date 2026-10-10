@@ -5,6 +5,43 @@ All notable changes to Zunesha are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed — review round 1 (2026-10-09)
+
+- **P1 (soundness):** `VulkanDevice: Send + Sync` made the unsynchronized
+  staging paths reachable from safe code via cloned `Arc`s — the compute
+  queue and transfer command pool are externally synchronized Vulkan
+  objects. All submissions are now serialized through a `submit_lock`:
+  internally for the substrate's staging transfers, and for consumers via
+  the new `VulkanDevice::with_compute_queue` accessor (the protocol
+  consumers must join to submit on the shared queue). Regression:
+  `concurrent_buffer_creation_is_serialized` (4 threads × create+read).
+- Teardown: the blanket `device_wait_idle` in `Drop` is now gated on the
+  epoch tracker (a no-op today until consumer dispatch accounting is
+  wired; activates exactly when work is outstanding) — removes the
+  parallel-teardown driver-lock stampede regressed from Borsalino's prior
+  discipline (review finding on both repos).
+
+### Added
+
+- `VulkanDevice` now overrides `create_device_buffer` /
+  `create_device_buffer_uninit` to **force device-local + staging
+  allocation regardless of the negotiated strategy** — a consumer that
+  forces `MemoryStrategy::Unified` on discrete hardware still gets
+  VRAM-resident data for GPU-resident weights. Found by the Borsalino
+  migration survey: the trait documented device-local placement but the
+  inherited default delegated to the strategy-respecting `create_buffer`
+  (Borsalino's own implementation diverges from its trait docs the other
+  way — host-visible under forced `Unified`; this override implements the
+  documented contract instead). The trait docs now state the override
+  contract and the `create_buffer`-vs-`create_device_buffer` behavioral
+  distinction. Behavior-preserving refactor:
+  `create_buffer`/`create_buffer_uninit` delegate to a shared
+  `buffer_new` path (also removes their internal duplication). Pinned by
+  `device_buffer_forces_device_local_under_unified_strategy` (discrete-GPU
+  test, verified on RTX 5080).
+
 ## [0.1.0] — 2026-10-03
 
 ### Fixed — review findings, round 3 (2026-10-03)
