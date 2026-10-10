@@ -21,10 +21,15 @@ step now frees what was created before it propagates:
   buffers is indeterminate — that case deliberately leaks rather than
   destroy in-flight resources (r2 P1), and sets a device-level
   `unconfirmed_submission` flag (r3 P1s) that every destruction path
-  now honors: buffer drop and device teardown quiesce best-effort first
-  (`quiesce_for_teardown` / inline `device_wait_idle`) and LEAK —
-  with a stderr note — rather than destroy, if the device will not
-  quiesce (sound for persistent host-OOM and device loss alike).
+  now honors: buffer drop and device teardown quiesce best-effort and
+  LEAK — with a stderr note — rather than destroy, if the device will
+  not quiesce (sound for persistent host-OOM and device loss alike).
+  Quiescing is SERIALIZED with submissions through the same lock
+  (r4 P1s: a lock-free quiesce could clear a taint a concurrent
+  submitter had just set — the lost pending-submission race — and
+  overlap `device_wait_idle` with in-flight queue use); the lock and
+  flag ship as one shared `TransferProtocol` Arc held by the device
+  and every buffer inner.
 - `allocate_buffer`: memory-type lookup, `vkAllocateMemory`,
   `vkBindBufferMemory`, and `vkMapMemory` failures destroy the buffer
   (and free the memory once allocated).

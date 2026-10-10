@@ -485,7 +485,7 @@ impl VulkanDevice {
     /// (the spec permits e.g. host-OOM from the wait; it is neither proof
     /// of device loss nor of completion), so reclaiming them would be a
     /// driver-level use-after-free. In that case the
-    /// [`unconfirmed_submission`](Self::unconfirmed_submission) flag is
+    /// [`TransferProtocol::unconfirmed`] flag is
     /// set: every destruction path (buffer drop, device teardown) then
     /// quiesces before destroying — or leaks. (Reviews r2+r3 P1.)
     fn one_shot_transfer(
@@ -558,7 +558,8 @@ impl VulkanDevice {
             if let Err(e) = self.device.queue_wait_idle(queue) {
                 // Submission reached the GPU; its completion is unconfirmed.
                 // Destruction paths must now quiesce-or-leak (r3 P1s).
-                self.unconfirmed_submission
+                self.protocol
+                    .unconfirmed
                     .store(true, std::sync::atomic::Ordering::Release);
                 return Err((
                     DeviceError::BufferCreationFailed {
@@ -574,24 +575,14 @@ impl VulkanDevice {
     }
 
     /// Best-effort quiesce before destroying resources a possibly-pending
-    /// submission may still touch. Returns `true` when destruction is
-    /// safe (no unconfirmed submission, or the wait succeeded — which
-    /// also clears the flag); `false` when the wait failed again — the
-    /// caller MUST leak rather than destroy (a second wait failure is
-    /// pathological — persistent host-OOM, or device loss, which this
-    /// code cannot distinguish; leaking is sound for both).
+    /// submission may still touch — SERIALIZED with submissions through
+    /// the shared protocol lock (a lock-free quiesce could clear a taint
+    /// a concurrent submitter had just set, or overlap `device_wait_idle`
+    /// with an in-flight submit; reviews r4 P1s). Returns `true` when
+    /// destruction is safe; `false` means the caller MUST leak rather
+    /// than destroy.
     pub fn quiesce_for_teardown(&self) -> bool {
-        use std::sync::atomic::Ordering;
-        if !self.unconfirmed_submission.load(Ordering::Acquire) {
-            return true;
-        }
-        match unsafe { self.device.device_wait_idle() } {
-            Ok(()) => {
-                self.unconfirmed_submission.store(false, Ordering::Release);
-                true
-            }
-            Err(_) => false,
-        }
+        self.protocol.quiesce(&self.device)
     }
 }
 
@@ -630,6 +621,49 @@ fn align_up(value: vk::DeviceSize, alignment: vk::DeviceSize) -> vk::DeviceSize 
 /// Internal state for a Vulkan buffer, stored behind the opaque `Buffer.raw`
 /// pointer. Self-contained: clones the device handle so it can destroy itself
 /// on drop. (ash `Device` does not auto-destroy on Drop, so the clone is safe.)
+/// The submission/teardown protocol shared by the device and every
+/// buffer inner: the compute-queue/transfer-pool `submit_lock` (all
+/// submissions AND all quiesces serialize through it — a quiesce's
+/// load→wait→clear must be atomic with respect to new submissions, or a
+/// lost-taint race lets a later destroy race a pending transfer) and the
+/// `unconfirmed` flag (a submission reached the GPU but its wait failed).
+/// (Reviews r2–r4 P1s.)
+struct TransferProtocol {
+    unconfirmed: std::sync::atomic::AtomicBool,
+    submit_lock: std::sync::Mutex<()>,
+}
+
+impl TransferProtocol {
+    /// Quiesce-or-leak, SERIALIZED with submissions via `submit_lock`.
+    /// Returns `true` when destruction is safe (no unconfirmed
+    /// submission, or `device_wait_idle` succeeded — which also clears
+    /// the flag under the lock, so a concurrent taint cannot be lost);
+    /// `false` when the wait failed again — the caller MUST leak rather
+    /// than destroy (persistent host-OOM or device loss are
+    /// indistinguishable here; leaking is sound for both).
+    fn quiesce(&self, device: &ash::Device) -> bool {
+        use std::sync::atomic::Ordering;
+        // Poison-steal: teardown must proceed after a submitter panicked.
+        let _guard = self
+            .submit_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !self.unconfirmed.load(Ordering::Acquire) {
+            return true;
+        }
+        match unsafe { device.device_wait_idle() } {
+            Ok(()) => {
+                // Holding submit_lock: no submission can have started
+                // since the load, so the wait retired everything the flag
+                // could refer to — the clear cannot lose a taint.
+                self.unconfirmed.store(false, Ordering::Release);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
 struct VulkanBufferInner {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
@@ -644,10 +678,10 @@ struct VulkanBufferInner {
     staging_memory: Option<vk::DeviceMemory>,
     /// Clone of the logical device, used for destroy in drop.
     device: ash::Device,
-    /// Shared with the device: set when a submission's completion is
-    /// UNCONFIRMED (submit succeeded, wait failed). Destruction of these
-    /// resources must then quiesce first — or leak (review r3 P1s).
-    unconfirmed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Shared with the device: carries the submission lock and the
+    /// unconfirmed-submission flag — destruction quiesces through it or
+    /// leaks (reviews r3+r4 P1s).
+    protocol: std::sync::Arc<TransferProtocol>,
 }
 
 unsafe impl Send for VulkanBufferInner {}
@@ -655,22 +689,19 @@ unsafe impl Sync for VulkanBufferInner {}
 
 impl Drop for VulkanBufferInner {
     fn drop(&mut self) {
-        use std::sync::atomic::Ordering;
-        // Review r3 P1 (readback path): if a submission touching this
+        // Reviews r3+r4 P1s (readback path): if a submission touching this
         // buffer is UNCONFIRMED (submit succeeded, wait failed), the GPU's
         // access is indeterminate — destroying now would be a driver-level
-        // use-after-free. Best-effort quiesce; on a second wait failure
-        // leak rather than destroy (sound for both persistent host-OOM
-        // and device loss, which cannot be distinguished here).
-        if self.unconfirmed.load(Ordering::Acquire)
-            && unsafe { self.device.device_wait_idle() }.is_err()
-        {
+        // use-after-free. Quiesce SERIALIZED with submissions (the shared
+        // protocol lock); on a second wait failure leak rather than
+        // destroy (sound for both persistent host-OOM and device loss,
+        // which cannot be distinguished here).
+        if !self.protocol.quiesce(&self.device) {
             eprintln!(
                 "zunesha: leaking buffer — a submission is unconfirmed and the device will not quiesce"
             );
             return;
         }
-        self.unconfirmed.store(false, Ordering::Release);
         // Safety: the buffer owns its resources exclusively; `free_memory`
         // implicitly unmaps any mapped memory. The device handle is valid
         // because buffers must not outlive the device (documented invariant).
@@ -724,22 +755,18 @@ pub struct VulkanDevice {
     /// Serializes every submission to the shared compute queue and every
     /// use of `command_pool` — both are *externally synchronized* Vulkan
     /// objects (one host thread at a time, spec §7). The substrate's own
-    /// staging transfers and consumer submissions
-    /// ([`with_compute_queue`](VulkanDevice::with_compute_queue)) take this
-    /// lock, which is what makes `Send + Sync` sound (review round 1, P1).
-    submit_lock: std::sync::Mutex<()>,
+    /// staging transfers, consumer submissions
+    /// ([`with_compute_queue`](VulkanDevice::with_compute_queue)), AND
+    /// teardown quiesces serialize through this lock (shared with buffer
+    /// inners via [`TransferProtocol`]), which is what makes
+    /// `Send + Sync` sound (reviews r1+r4 P1s).
+    protocol: std::sync::Arc<TransferProtocol>,
     memory_properties: vk::PhysicalDeviceMemoryProperties,
     memory_strategy: MemoryStrategy,
     /// Effective memory placement: device-local (VRAM) vs host-visible.
     uses_device_local: bool,
     limits: DeviceLimits,
     epoch: GpuEpochTracker,
-    /// Set when a submission's completion is UNCONFIRMED (submit
-    /// succeeded, wait failed — the GPU's access to recorded resources
-    /// is then indeterminate). Destruction paths (buffer drop, device
-    /// teardown) must quiesce before destroying — or leak. See
-    /// [`one_shot_transfer`](VulkanDevice::one_shot_transfer).
-    unconfirmed_submission: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Drop for VulkanDevice {
@@ -901,8 +928,10 @@ impl VulkanDevice {
             uses_device_local,
             limits,
             epoch: GpuEpochTracker::new(),
-            unconfirmed_submission: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            submit_lock: std::sync::Mutex::new(()),
+            protocol: std::sync::Arc::new(TransferProtocol {
+                unconfirmed: std::sync::atomic::AtomicBool::new(false),
+                submit_lock: std::sync::Mutex::new(()),
+            }),
         })
     }
 
@@ -1020,7 +1049,7 @@ impl VulkanDevice {
             staging_buffer,
             staging_memory,
             device: self.device.clone(),
-            unconfirmed: std::sync::Arc::clone(&self.unconfirmed_submission),
+            protocol: std::sync::Arc::clone(&self.protocol),
         });
         Ok(crate::Buffer {
             raw: Box::into_raw(inner) as *mut c_void,
@@ -1102,6 +1131,7 @@ impl VulkanDevice {
         // state is still usable (Vulkan object state is not corrupted by a
         // host panic between calls), so steal the lock and continue.
         let _guard = self
+            .protocol
             .submit_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
