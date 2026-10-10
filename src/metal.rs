@@ -15,7 +15,7 @@
 //!
 //! - **`MemoryStrategy` is honoured, not ignored.** Borsalino-Metal always
 //!   allocated `Shared`; here `DeviceLocal` maps to `MTLStorageModePrivate`
-//!   + Shared staging + `MTLBlitCommandEncoder` copies (mirroring the
+//!   with Shared staging and `MTLBlitCommandEncoder` copies (mirroring the
 //!   Vulkan backend's staging design), and
 //!   [`create_device_buffer`](Device::create_device_buffer) forces that
 //!   path regardless of the negotiated strategy (the post-0.1.1 contract).
@@ -48,7 +48,6 @@ use crate::{
 // ── Metal C symbols ───────────────────────────────────────────────
 
 #[link(name = "Metal", kind = "framework")]
-#[link(name = "Foundation", kind = "framework")]
 unsafe extern "C" {
     /// Returns the system default Metal device, or null. +1 (create) — the
     /// caller owns the returned reference.
@@ -408,6 +407,42 @@ impl MetalDevice {
         }
     }
 
+    /// Raw MTLDevice handle — a **retained borrow** (R4 contract).
+    ///
+    /// Zunesha owns the device; consumers (Borsalino-Metal: shader
+    /// compilation; Goldenweek-Metal later: pipelines) must not release it.
+    /// Valid for the lifetime of the [`MetalDevice`].
+    #[must_use]
+    pub fn raw_device(&self) -> *mut c_void {
+        self.device
+    }
+
+    /// Raw MTLBuffer handle for a buffer created by this device (R4).
+    ///
+    /// Exposed so consumers can bind Zunesha buffers into their own
+    /// command encoders (`setBuffer:offset:atIndex:`) — the zero-copy
+    /// compute→render interop path (ADR 0001). The handle is valid while
+    /// the [`crate::Buffer`] lives; consumers must not release it.
+    #[must_use]
+    pub fn raw_buffer(&self, buffer: &crate::Buffer) -> *mut c_void {
+        // Safety: `raw` was produced by `Box::into_raw::<MetalBufferInner>`
+        // in `buffer_new` and remains valid while `buffer` is alive.
+        unsafe { (*(buffer.raw as *const MetalBufferInner)).buffer }
+    }
+
+    /// The MTLCommandQueue handle Zunesha owns (same value as
+    /// `queues().compute.raw` and `queues().graphics`).
+    ///
+    /// Convenience for consumers that prefer an explicit accessor over
+    /// the [`Queues`] view; the ownership contract is identical — dispatch
+    /// on it, never release it. `MTLCommandQueue` is documented
+    /// thread-safe, so unlike the Vulkan backend there is no
+    /// submission-lock protocol to join (ADR 0004).
+    #[must_use]
+    pub fn command_queue(&self) -> *mut c_void {
+        self.queue
+    }
+
     /// Build a device from a full [`InitRequest`].
     fn build(request: InitRequest) -> Result<Self> {
         // R5.1: every objc-minting path runs inside an autorelease pool —
@@ -564,6 +599,26 @@ impl Device for MetalDevice {
 
     fn create_buffer_uninit<T: bytemuck::Pod>(&self, len: usize) -> Result<crate::Buffer> {
         self.buffer_new(len * std::mem::size_of::<T>(), None, false)
+    }
+
+    /// Forces the Private + staging path regardless of the negotiated
+    /// strategy — the mandatory override (R3, post-0.1.1 contract, no
+    /// deferral and no silent Shared fallback). On Metal,
+    /// `MTLStorageModePrivate` exists on every device, so there is no
+    /// hard-error branch here (the R1 explicit-error allowance never
+    /// applies to this override).
+    fn create_device_buffer<T: bytemuck::Pod>(&self, data: &[T]) -> Result<crate::Buffer> {
+        self.buffer_new(
+            std::mem::size_of_val(data),
+            Some(data.as_ptr() as *const c_void),
+            true,
+        )
+    }
+
+    /// Uninitialised variant of
+    /// [`create_device_buffer`](Self::create_device_buffer).
+    fn create_device_buffer_uninit<T: bytemuck::Pod>(&self, len: usize) -> Result<crate::Buffer> {
+        self.buffer_new(len * std::mem::size_of::<T>(), None, true)
     }
 
     fn read_buffer<T: bytemuck::Pod>(&self, buffer: &crate::Buffer) -> Result<Vec<T>> {
@@ -763,6 +818,220 @@ mod tests {
             .expect("create_buffer_uninit (zero-length)");
         let read: Vec<u8> = device.read_buffer(&uninit).expect("read uninit zero");
         assert!(read.is_empty());
+    }
+
+    /// Escape hatches (R4): the three raw surfaces Borsalino-Metal needs —
+    /// MTLDevice (compile), MTLCommandQueue (dispatch), MTLBuffer (binding).
+    /// Nothing more is exposed.
+    #[test]
+    #[serial]
+    fn escape_hatches_expose_raw_handles() {
+        let Some(device) = test_device() else { return };
+        assert!(
+            !device.raw_device().is_null(),
+            "raw_device must be the MTLDevice"
+        );
+        assert_eq!(
+            device.command_queue(),
+            device.queues().compute.raw,
+            "command_queue is the same handle the Queues expose"
+        );
+        let buffer = device.create_buffer(&[1u32, 2, 3]).expect("create_buffer");
+        assert!(
+            !device.raw_buffer(&buffer).is_null(),
+            "raw_buffer must be the MTLBuffer"
+        );
+    }
+
+    /// The R4 consumer contract, exercised consumer-style: raw handles
+    /// only — real GPU work (a blit copy between two Zunesha buffers)
+    /// encoded on the queue from `queues()`, no shader compilation, no
+    /// substrate assistance beyond the handles.
+    #[test]
+    #[serial]
+    fn consumer_style_blit_via_raw_handles() {
+        let Some(device) = test_device() else { return };
+        let src = device.create_buffer(&[10u32, 20, 30, 40]).expect("src");
+        let dst = device.create_buffer_uninit::<u32>(4).expect("dst");
+
+        let queue = device.queues().compute.raw;
+        let src_raw = device.raw_buffer(&src);
+        let dst_raw = device.raw_buffer(&dst);
+        assert!(!queue.is_null(), "queue handle must be real");
+        assert!(!src_raw.is_null(), "raw_buffer(src) must be real");
+        assert!(!dst_raw.is_null(), "raw_buffer(dst) must be real");
+
+        objc::rc::autoreleasepool(|| unsafe {
+            let cmd: *mut c_void = msg_send![obj(queue), commandBuffer];
+            assert!(!cmd.is_null());
+            let enc: *mut c_void = msg_send![obj(cmd), blitCommandEncoder];
+            assert!(!enc.is_null());
+            let _: () = msg_send![obj(enc),
+                copyFromBuffer: src_raw
+                sourceOffset: 0u64
+                toBuffer: dst_raw
+                destinationOffset: 0u64
+                size: 16u64];
+            let _: () = msg_send![obj(enc), endEncoding];
+            let _: () = msg_send![obj(cmd), commit];
+            let _: () = msg_send![obj(cmd), waitUntilCompleted];
+            // cmd/enc are +0 autoreleased — never released here (R5.2).
+        });
+
+        let out: Vec<u32> = device.read_buffer(&dst).expect("read dst");
+        assert_eq!(out, vec![10, 20, 30, 40]);
+    }
+
+    /// DeviceLocal strategy: Private storage + staging in both directions
+    /// (port of the Vulkan backend's `buffer_roundtrip_device_local`).
+    #[test]
+    #[serial]
+    fn buffer_roundtrip_device_local() {
+        let device = match MetalDevice::init_with_strategy(MemoryStrategy::DeviceLocal) {
+            Ok(d) => d,
+            Err(e) => {
+                assert!(
+                    std::env::var("ZUNESHA_REQUIRE_METAL").is_err(),
+                    "ZUNESHA_REQUIRE_METAL is set but DeviceLocal init failed: {e}"
+                );
+                eprintln!("skipping: no Metal device ({e})");
+                return;
+            }
+        };
+        assert_eq!(device.buffer_placement(), MemoryPlacement::DeviceLocal);
+        let input: Vec<u32> = (0..1000).collect();
+        let buffer = device
+            .create_buffer(&input)
+            .expect("create_buffer (private)");
+        let output: Vec<u32> = device.read_buffer(&buffer).expect("read_buffer (private)");
+        assert_eq!(output, input);
+    }
+
+    /// `create_device_buffer` must force the Private + staging path even
+    /// under a forced-`Unified` device — the mandatory override (R3),
+    /// mirroring the Vulkan backend's post-0.1.1 contract. Observable via
+    /// internals: a Private allocation carries a staging buffer;
+    /// strategy-respecting `create_buffer` under `Unified` does not.
+    #[test]
+    #[serial]
+    fn device_buffer_forces_private_under_unified_strategy() {
+        let device = match MetalDevice::init_with_strategy(MemoryStrategy::Unified) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device ({e})");
+                return;
+            }
+        };
+        let unified = device.create_buffer(&[1.0f32, 2.0, 3.0, 4.0]).unwrap();
+        let forced = device
+            .create_device_buffer(&[1.0f32, 2.0, 3.0, 4.0])
+            .unwrap();
+
+        // Safety: both handles were produced by this device's create paths.
+        let u = unsafe { &*(unified.raw as *const MetalBufferInner) };
+        let f = unsafe { &*(forced.raw as *const MetalBufferInner) };
+        assert!(
+            u.staging.is_none(),
+            "Unified-strategy create_buffer must stay Shared"
+        );
+        assert!(
+            f.staging.is_some(),
+            "create_device_buffer must force the Private + staging path"
+        );
+
+        let r1: Vec<f32> = device.read_buffer(&unified).unwrap();
+        let r2: Vec<f32> = device.read_buffer(&forced).unwrap();
+        assert_eq!(r1, vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(r2, vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    /// R5.6 pool-escape regression: a **retained (+0-escaped)** command
+    /// buffer survives an autoreleasepool drain and still completes. This
+    /// is the accounting that keeps async consumer work (Borsalino's
+    /// `Pulse` shape) sound: explicit `retain` owns the escape, the pool's
+    /// drain must not invalidate it, and the balancing `release` follows
+    /// completion. Without the retain this test is the over-release
+    /// SIGSEGV / use-after-drain class.
+    #[test]
+    #[serial]
+    fn pool_drain_retained_command_buffer_completes() {
+        let Some(device) = test_device() else { return };
+        let src = device.create_buffer(&[7u32, 8, 9]).expect("src");
+        let dst = device.create_buffer_uninit::<u32>(3).expect("dst");
+
+        let (cmd, src_raw, dst_raw) = objc::rc::autoreleasepool(|| unsafe {
+            let cmd: *mut c_void = msg_send![obj(device.queue), commandBuffer];
+            assert!(!cmd.is_null());
+            let enc: *mut c_void = msg_send![obj(cmd), blitCommandEncoder];
+            assert!(!enc.is_null());
+            let src_raw = device.raw_buffer(&src);
+            let dst_raw = device.raw_buffer(&dst);
+            assert!(
+                !src_raw.is_null(),
+                "raw handles must be real before encoding"
+            );
+            assert!(
+                !dst_raw.is_null(),
+                "raw handles must be real before encoding"
+            );
+            let _: () = msg_send![obj(enc),
+                copyFromBuffer: src_raw
+                sourceOffset: 0u64
+                toBuffer: dst_raw
+                destinationOffset: 0u64
+                size: 16u64];
+            let _: () = msg_send![obj(enc), endEncoding];
+            let _: () = msg_send![obj(cmd), commit];
+            // +0 escape: the command buffer must outlive this pool — the
+            // explicit retain is the ownership (Borsalino's async Pulse
+            // pattern, R5.3 first bullet).
+            let _: () = msg_send![obj(cmd), retain];
+            (cmd, src_raw, dst_raw)
+        });
+        // Pool has drained. The retained command buffer must still be
+        // valid: wait for completion, then read the result.
+        unsafe {
+            let _: () = msg_send![obj(cmd), waitUntilCompleted];
+            let _: () = msg_send![obj(cmd), release];
+        }
+        let out: Vec<u32> = device.read_buffer(&dst).expect("read after drain");
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0], 7);
+        let _ = (src_raw, dst_raw); // handles stay valid across the drain
+    }
+
+    /// Safe code can share one `Arc<MetalDevice>` across threads (consumer
+    /// contract, same as Vulkan). Regression port of the Vulkan backend's
+    /// `concurrent_buffer_creation_is_serialized`: concurrent Private
+    /// buffer creation + readback from four threads round-trips exactly —
+    /// the `readback_lock` serializes the shared per-buffer staging
+    /// mappings (host-copy race, review round 2 P1 class).
+    #[test]
+    #[serial]
+    fn concurrent_private_buffer_readback_is_serialized() {
+        let device = match MetalDevice::init_with_strategy(MemoryStrategy::DeviceLocal) {
+            Ok(d) => std::sync::Arc::new(d),
+            Err(e) => {
+                eprintln!("skipping: no Metal device ({e})");
+                return;
+            }
+        };
+        let mut handles = Vec::new();
+        for t in 0..4u32 {
+            let device = std::sync::Arc::clone(&device);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..8u32 {
+                    let payload = [(t * 8 + i) as f32; 4];
+                    let buf = device.create_device_buffer(&payload).unwrap();
+                    let back: Vec<f32> = device.read_buffer(&buf).unwrap();
+                    assert_eq!(back, payload);
+                }
+            }));
+        }
+        for h in handles {
+            h.join()
+                .expect("no thread panicked under the readback lock");
+        }
     }
 
     /// `device_hint` matching: `MTLCopyAllDevices` name matching wins over
