@@ -599,6 +599,13 @@ pub struct VulkanDevice {
     compute_queue: vk::Queue,
     /// Transient command pool (on the compute family) for one-shot transfers.
     command_pool: vk::CommandPool,
+    /// Serializes every submission to the shared compute queue and every
+    /// use of `command_pool` — both are *externally synchronized* Vulkan
+    /// objects (one host thread at a time, spec §7). The substrate's own
+    /// staging transfers and consumer submissions
+    /// ([`with_compute_queue`](VulkanDevice::with_compute_queue)) take this
+    /// lock, which is what makes `Send + Sync` sound (review round 1, P1).
+    submit_lock: std::sync::Mutex<()>,
     memory_properties: vk::PhysicalDeviceMemoryProperties,
     memory_strategy: MemoryStrategy,
     /// Effective memory placement: device-local (VRAM) vs host-visible.
@@ -609,11 +616,25 @@ pub struct VulkanDevice {
 
 impl Drop for VulkanDevice {
     fn drop(&mut self) {
+        // Defensive idle is GATED on the epoch tracker, not blanket:
+        // Zunesha's own one-shot transfers retire synchronously, and the
+        // consumer contract is that all submissions are retired before the
+        // last handle drops (Borsalino pulses wait their fence *before*
+        // releasing their `Arc`). A blanket `device_wait_idle` on every
+        // last-release teardown stampedes driver-internal locks under
+        // parallel test load — the failure mode Borsalino removed from its
+        // own teardown and review round 1 flagged as regressed here. When
+        // consumer dispatch accounting is wired into the tracker (ADR 0003
+        // end state), this backstop fires exactly when work is outstanding.
+        if self.epoch.in_flight() > 0 {
+            unsafe {
+                self.device.device_wait_idle().ok();
+            }
+        }
         // Safety: command pool before device before instance (Vulkan order).
         // Buffers must already have been dropped by the caller (documented
         // invariant) — they hold a cloned device handle.
         unsafe {
-            self.device.device_wait_idle().ok();
             self.device.destroy_command_pool(self.command_pool, None);
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
@@ -625,9 +646,12 @@ impl Drop for VulkanDevice {
 // threads — Borsalino's consumer contract (its buffers/pulses may outlive
 // the backend and are moved between threads). Sound because: every field is
 // either an ash handle (Send+Sync by ash's own impls), the loader `Entry`
-// (fn tables + `Arc<Library>`), or the atomic epoch tracker; all mutation
-// goes through driver calls and atomics. Command-pool use is single-threaded
-// by the host-synchronous dispatch discipline (architecture doc).
+// (fn tables + `Arc<Library>`), or the atomic epoch tracker; and every
+// mutation of the externally-synchronized shared objects (the compute queue
+// and the transfer command pool) is serialized through `submit_lock` —
+// internally by the staging paths, and by consumers via
+// `with_compute_queue` (review round 1, P1: without that protocol, safe
+// code could race `vkQueueSubmit`/command-pool use from cloned `Arc`s).
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<VulkanDevice>();
@@ -738,6 +762,7 @@ impl VulkanDevice {
             uses_device_local,
             limits,
             epoch: GpuEpochTracker::new(),
+            submit_lock: std::sync::Mutex::new(()),
         })
     }
 
@@ -791,22 +816,17 @@ impl VulkanDevice {
             if let Some(src) = data {
                 if byte_len > 0 {
                     unsafe { ptr::copy_nonoverlapping(src, stg_mapped, byte_len as usize) };
-                    unsafe {
-                        one_shot_transfer(
-                            &self.device,
-                            self.command_pool,
-                            self.compute_queue,
-                            |cmd| {
-                                let copy = vk::BufferCopy::default().size(aligned);
-                                self.device.cmd_copy_buffer(
-                                    cmd,
-                                    stg_buf,
-                                    dev_buf,
-                                    std::slice::from_ref(&copy),
-                                );
-                            },
-                        )?;
-                    }
+                    self.with_compute_queue(|queue| unsafe {
+                        one_shot_transfer(&self.device, self.command_pool, queue, |cmd| {
+                            let copy = vk::BufferCopy::default().size(aligned);
+                            self.device.cmd_copy_buffer(
+                                cmd,
+                                stg_buf,
+                                dev_buf,
+                                std::slice::from_ref(&copy),
+                            );
+                        })
+                    })?;
                 }
             }
             (dev_buf, dev_mem, stg_mapped, Some(stg_buf), Some(stg_mem))
@@ -890,6 +910,32 @@ impl VulkanDevice {
         // `create_buffer` and remains valid while `buffer` is alive.
         unsafe { (*(buffer.raw as *const VulkanBufferInner)).buffer }
     }
+
+    /// Run `f` with the shared compute queue, serialized against every
+    /// other submission (the substrate's own staging transfers and other
+    /// consumers' dispatch work).
+    ///
+    /// Vulkan queues and command pools are *externally synchronized*
+    /// objects — at most one host thread may touch a given queue/pool at a
+    /// time (spec host-sync rules). Since [`VulkanDevice`] is `Send + Sync`
+    /// and shareable behind an `Arc`, every submitter must join this
+    /// protocol: **consumers that submit work on the compute queue must do
+    /// so inside this accessor** (submit AND any immediate wait —
+    /// `queue_wait_idle` counts as queue access). Fence-based waits after
+    /// the submit returns do not touch the queue and need no lock.
+    ///
+    /// The lock is held only for the closure's duration; it is never held
+    /// across a long-running GPU wait started elsewhere.
+    pub fn with_compute_queue<R>(&self, f: impl FnOnce(vk::Queue) -> R) -> R {
+        // Poisoning only means a submitter panicked mid-closure; the queue
+        // state is still usable (Vulkan object state is not corrupted by a
+        // host panic between calls), so steal the lock and continue.
+        let _guard = self
+            .submit_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        f(self.compute_queue)
+    }
 }
 
 impl Device for VulkanDevice {
@@ -967,8 +1013,8 @@ impl Device for VulkanDevice {
         // Device-local buffers: copy device → staging, then read the staging
         // mapping. Unified buffers: read the buffer's own mapping directly.
         if let Some(stg_buf) = inner.staging_buffer {
-            unsafe {
-                one_shot_transfer(&self.device, self.command_pool, self.compute_queue, |cmd| {
+            self.with_compute_queue(|queue| unsafe {
+                one_shot_transfer(&self.device, self.command_pool, queue, |cmd| {
                     let copy = vk::BufferCopy::default().size(inner.size);
                     self.device.cmd_copy_buffer(
                         cmd,
@@ -976,8 +1022,8 @@ impl Device for VulkanDevice {
                         stg_buf,
                         std::slice::from_ref(&copy),
                     );
-                })?;
-            }
+                })
+            })?;
         }
 
         if inner.mapped.is_null() {
@@ -1250,6 +1296,38 @@ mod tests {
     /// Observable via internals: a device-local allocation carries a staging
     /// buffer; the strategy-respecting `create_buffer` under `Unified` does
     /// not. Both must still upload and read back exactly.
+    /// Safe code can share one `Arc<VulkanDevice>` across threads; the
+    /// staging transfers those threads trigger must therefore be internally
+    /// serialized (the `submit_lock` protocol — review round 1's P1).
+    /// Regression: concurrent device-local buffer creation + readback from
+    /// four threads round-trips exactly and does not deadlock.
+    #[test]
+    #[serial]
+    fn concurrent_buffer_creation_is_serialized() {
+        let device = std::sync::Arc::new(match VulkanDevice::init() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Vulkan device ({e})");
+                return;
+            }
+        });
+        let mut handles = Vec::new();
+        for t in 0..4u32 {
+            let device = std::sync::Arc::clone(&device);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..8u32 {
+                    let payload = [(t * 8 + i) as f32; 4];
+                    let buf = device.create_device_buffer(&payload).unwrap();
+                    let back: Vec<f32> = device.read_buffer(&buf).unwrap();
+                    assert_eq!(back, payload);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("no thread panicked under the submit lock");
+        }
+    }
+
     #[test]
     #[serial]
     fn device_buffer_forces_device_local_under_unified_strategy() {
