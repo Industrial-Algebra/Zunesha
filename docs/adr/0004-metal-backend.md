@@ -181,7 +181,7 @@ lands, it lands for both backends at once.
 
 ## Verification
 
-Verified on an Apple M5 Max (this machine), 31 tests green under
+Verified on an Apple M5 Max (this machine), 35 tests green under
 `ZUNESHA_REQUIRE_METAL=1`:
 
 - `metal_device_inits_and_names_itself`, `queues_shape_matches_adr_0004`,
@@ -225,6 +225,12 @@ there as follow-up work, out of this backend's scope.
 - **`MTLHeap` sub-allocation** — not required for parity with Vulkan 0.1
   (plain `newBufferWithLength` suffices); noted as future work if
   fragmentation ever matters.
-- **Per-buffer readback locks** — deferred (see Consequences): a
-  device-wide lock is correct and simpler until a consumer demonstrates
-  concurrent-Private-readback contention.
+- **A per-device readback lock** — the first cut serialized Private
+  readback on a device-wide mutex (mirroring the Vulkan backend's
+  shape). Review round 1 demonstrated its race:
+  `MTLCreateSystemDefaultDevice` returns a per-GPU singleton, so two
+  `MetalDevice` instances share one MTLDevice while owning different
+  locks — safe code could race one staging mapping under two locks.
+  Rejected in favour of per-buffer locking, where the mutex lives with
+  the mapping it guards (and genuinely foreign-MTLDevice reads are
+  rejected outright).

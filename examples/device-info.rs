@@ -1,8 +1,14 @@
 // Copyright (C) 2026 Industrial Algebra
 // SPDX-License-Identifier: Apache-2.0
 
-// Mirrors the cfg of `zunesha::vulkan` (not macOS).
-#![cfg(all(feature = "vulkan", not(target_os = "macos")))]
+// The vulkan backend is Linux/Windows-only. Gate the body — but keep a
+// compiling `main` on every target, so any cargo-selectable feature
+// combination builds `--all-targets` everywhere (the metal examples
+// established the pattern; review r2 P3 closed this pre-existing gap).
+#![cfg_attr(
+    not(all(feature = "vulkan", not(target_os = "macos"))),
+    allow(unused_imports)
+)]
 
 //! Print what the substrate resolved on this host: the queue shape
 //! (capability-driven, ADR 0002), limits, memory strategy, and the
@@ -18,6 +24,7 @@ use std::process::ExitCode;
 
 use zunesha::{Device, InitRequest};
 
+#[cfg(all(feature = "vulkan", not(target_os = "macos")))]
 fn main() -> ExitCode {
     let hint = std::env::var("ZUNESHA_TEST_DEVICE").ok();
     let mut request = InitRequest::prefer_graphics();
@@ -60,4 +67,11 @@ fn main() -> ExitCode {
         device.buffer_placement()
     );
     ExitCode::SUCCESS
+}
+
+#[cfg(not(all(feature = "vulkan", not(target_os = "macos"))))]
+fn main() {
+    eprintln!(
+        "device-info: the vulkan backend is Linux/Windows-only; this is the non-Vulkan stub build."
+    );
 }
