@@ -205,6 +205,16 @@ impl Queue {
     }
 }
 
+// Safety: `Queue` is a plain handle value (the same shape ash's own handle
+// types carry, which assert Send+Sync the same way). Sharing the *value*
+// across threads is safe: the driver owns the pointed-to object, and all
+// submission paths that use the handle are serialized by the consumer's
+// dispatch discipline (host-synchronous today — see the architecture doc's
+// cross-queue note). This also unblocks `VulkanDevice: Send + Sync`, which
+// consumers (Borsalino) need to share one device behind an `Arc`.
+unsafe impl Send for Queue {}
+unsafe impl Sync for Queue {}
+
 /// The queue families a [`Device`] exposes.
 ///
 /// Capability-driven: `compute` is always present (Zunesha's baseline
@@ -413,8 +423,24 @@ pub trait Device: Sized {
 
     /// Allocate a device-local buffer and upload initial data.
     ///
-    /// Persists across dispatches without CPU readback overhead. On unified
-    /// memory (Apple Silicon, GB10) identical to [`create_buffer`](Self::create_buffer).
+    /// Persists across dispatches without CPU readback overhead.
+    ///
+    /// Distinct from [`create_buffer`](Self::create_buffer) in **allocation
+    /// behavior**, not merely placement: `create_buffer` follows the
+    /// negotiated strategy (host-visible under `Unified`, device-local +
+    /// staging under `DeviceLocal`/`Auto` on discrete hardware), while this
+    /// forces the device-local profile wherever the platform distinguishes
+    /// placement. On hardware with no distinct device-local heap the forced
+    /// profile degrades to the same memory as `create_buffer` (possibly
+    /// still staging-mediated per backend).
+    ///
+    /// **Override contract:** backends that distinguish memory placement
+    /// override this (and the `_uninit` twin) to force device-local
+    /// allocation **regardless of the negotiated strategy** — a consumer
+    /// that forced [`MemoryStrategy::Unified`] on discrete hardware still
+    /// gets VRAM-resident data here (GPU-resident weights; Borsalino's
+    /// contract). The trait default delegates to `create_buffer` for
+    /// placement-blind backends.
     fn create_device_buffer<T: bytemuck::Pod>(&self, data: &[T]) -> Result<Buffer> {
         self.create_buffer(data)
     }
