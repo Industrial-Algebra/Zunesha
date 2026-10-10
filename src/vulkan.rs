@@ -781,9 +781,11 @@ impl VulkanDevice {
     /// `force_device_local` takes the device-local + staging path even when
     /// the negotiated strategy is host-visible — the
     /// [`Device::create_device_buffer`](crate::Device::create_device_buffer)
-    /// contract: GPU-resident data under a forced-`Unified` device (found by
-    /// the Borsalino migration survey; its own backend overrides the same
-    /// way).
+    /// contract: GPU-resident data under a forced-`Unified` device. Found by
+    /// the Borsalino migration survey — note Borsalino's own override
+    /// diverges from its trait docs the *other* way (host-visible under
+    /// forced `Unified`); this implements the documented contract, not
+    /// Borsalino's behavior.
     fn buffer_new(
         &self,
         byte_len: vk::DeviceSize,
@@ -1010,22 +1012,6 @@ impl Device for VulkanDevice {
         // is still valid (buffer not dropped).
         let inner = unsafe { &*(buffer.raw as *const VulkanBufferInner) };
 
-        // Device-local buffers: copy device → staging, then read the staging
-        // mapping. Unified buffers: read the buffer's own mapping directly.
-        if let Some(stg_buf) = inner.staging_buffer {
-            self.with_compute_queue(|queue| unsafe {
-                one_shot_transfer(&self.device, self.command_pool, queue, |cmd| {
-                    let copy = vk::BufferCopy::default().size(inner.size);
-                    self.device.cmd_copy_buffer(
-                        cmd,
-                        inner.buffer,
-                        stg_buf,
-                        std::slice::from_ref(&copy),
-                    );
-                })
-            })?;
-        }
-
         if inner.mapped.is_null() {
             return Err(DeviceError::BufferReadFailed {
                 message: "buffer is not host-visible (no staging mapping)".into(),
@@ -1037,9 +1023,30 @@ impl Device for VulkanDevice {
         } else {
             buffer.len / mem::size_of::<T>()
         };
-        let src = inner.mapped as *const T;
-        let slice = unsafe { std::slice::from_raw_parts(src, count) };
-        Ok(slice.to_vec())
+
+        // Device-local buffers: copy device → staging, then read the staging
+        // mapping — BOTH under the submission lock. The staging mapping is
+        // shared per-buffer: releasing the lock between the transfer and the
+        // host copy would let a concurrent `read_buffer` of the same buffer
+        // rewrite the mapping mid-copy (review round 2, P1). Unified buffers
+        // (no staging) read their own mapping directly — no transfer, no
+        // staging race — and still take the lock for uniformity.
+        Ok(self.with_compute_queue(|queue| unsafe {
+            if let Some(stg_buf) = inner.staging_buffer {
+                one_shot_transfer(&self.device, self.command_pool, queue, |cmd| {
+                    let copy = vk::BufferCopy::default().size(inner.size);
+                    self.device.cmd_copy_buffer(
+                        cmd,
+                        inner.buffer,
+                        stg_buf,
+                        std::slice::from_ref(&copy),
+                    );
+                })?;
+            }
+            let src = inner.mapped as *const T;
+            let slice = std::slice::from_raw_parts(src, count);
+            slice.to_vec()
+        })?)
     }
 
     fn in_flight(&self) -> u64 {
@@ -1288,10 +1295,10 @@ mod tests {
     }
 
     /// `create_device_buffer` must allocate device-local even when the
-    /// device strategy is forced `Unified` — the contract Borsalino relies
-    /// on for GPU-resident weights (its own Vulkan backend overrides the
-    /// trait default the same way; found by the Borsalino migration survey,
-    /// migration plan §5.1).
+    /// device strategy is forced `Unified` — the documented trait contract
+    /// for GPU-resident data (Borsalino's own implementation takes the
+    /// host-visible path there instead, diverging from its trait docs;
+    /// see the Borsalino migration plan §5.1 for the full relationship).
     ///
     /// Observable via internals: a device-local allocation carries a staging
     /// buffer; the strategy-respecting `create_buffer` under `Unified` does
