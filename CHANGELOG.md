@@ -65,6 +65,35 @@ mock layer and a test-only allocator seam is out of patch scope); the
 cleanup is verified by construction and code review, matching the
 discipline Borsalino adopted for the same shapes.
 
+### Added — Metal backend (ADR 0004)
+
+- **`metal` feature** (macOS, `dep:objc`): `MetalDevice` implementing
+  `Device` — ADR-0004 queue reinterpretation (the owned MTLCommandQueue
+  services compute + graphics; transfer `None`), `MTLCopyAllDevices`
+  device-hint matching, Shared and Private + staging storage modes,
+  `create_device_buffer` mandatory override (forces Private regardless of
+  strategy), escape hatches (`raw_device`, `raw_buffer`, `command_queue`),
+  pools on every objc-minting path, and `ZUNESHA_REQUIRE_METAL` CI
+  semantics. Verified on Apple M5 Max (18 Metal tests; 35-test suite green under `ZUNESHA_REQUIRE_METAL=1`).
+- **macOS CI** — self-hosted `test-macos` job (hantaro fleet recipe) with
+  `ZUNESHA_REQUIRE_METAL=1`.
+- **Examples** — `device-info-metal`, `buffer-roundtrip-metal` (with
+  non-macOS fallback builds).
+
+### Fixed — Metal backend review round 1 (2026-10-10)
+
+- Typed readback over Metal `contents()` mappings was UB for over-aligned
+  `Pod` types — replaced by an aligned byte-copy (`collect_aligned`).
+- Per-device readback locking was bypassable by second `MetalDevice`
+  instances sharing the MTLDevice singleton — synchronization moved into
+  per-buffer state, and genuinely foreign-device reads are rejected.
+- Allocation arithmetic could panic (debug) or wrap (release) on overflow —
+  now checked, erroring `BufferCreationFailed` in every profile.
+- `--features metal --all-targets` now compiles on Linux (example bodies
+  gated with a fallback `main`).
+- Known follow-up: the Vulkan backend carries the same readback-cast and
+  overflow patterns structurally — separate fix, tracked for its own PR.
+
 ## [0.1.1] — 2026-10-10
 
 ### Fixed — review round 2 (2026-10-10)

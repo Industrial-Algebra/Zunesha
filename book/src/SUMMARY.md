@@ -26,6 +26,7 @@
   - [ADR 0001 — Shared device substrate](./design/adr/0001-shared-device-substrate.md)
   - [ADR 0002 — Capability-driven queues](./design/adr/0002-capability-driven-queues.md)
   - [ADR 0003 — Cross-crate proof agreement](./design/adr/0003-cross-crate-proof-agreement.md)
+  - [ADR 0004 — Metal backend](./design/adr/0004-metal-backend.md)
 - [Critique & Future Work](./design/critique.md)
 - [Roadmap](./design/roadmap.md)
 

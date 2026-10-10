@@ -8,7 +8,8 @@ Zunesha owns the one thing that both
 [Borsalino](https://github.com/Industrial-Algebra/Borsalino) (compute) and
 [Goldenweek](https://github.com/Industrial-Algebra/Goldenweek) (graphics) need:
 **the GPU device and its memory**. Everything above it is a consumer; everything
-below it is a backend (today: Vulkan via raw `ash`).
+below it is a backend (Vulkan via raw `ash` on Linux/Windows, Metal via raw
+`objc` on macOS).
 
 ```
         ┌──────────────────────────────────────────┐
@@ -28,9 +29,9 @@ below it is a backend (today: Vulkan via raw `ash`).
                       │   (substrate)│
                       └──────┬──────┘
                              │
-                ┌────────────┴────────────┐
-                │   Vulkan (ash, raw FFI) │   ← backends (Metal planned)
-                └─────────────────────────┘
+                ┌──────────────┴──────────────┐
+                │ Vulkan (ash) · Metal (objc) │   ← backends
+                └─────────────────────────────┘
 ```
 
 ## Why a shared substrate exists
@@ -137,9 +138,13 @@ and are primarily used to exercise both paths in tests.
   epoch tracking. Verified on an NVIDIA RTX 5080 Laptop (`compute=2
   graphics=0 transfer=Some(1)` — three distinct families, async-compute-capable).
 - ✅ `NoDeviceStub` for compiling and testing without a GPU.
-- ⏳ Metal backend (raw `objc`) — planned, mirroring Borsalino's backend split.
-- ⏳ Borsalino refactor — a separate session consumes Zunesha as its device
-  layer (handoff recorded in agent memory).
+- ✅ Metal backend (`src/metal.rs`): ADR-0004 queue reinterpretation (the
+  owned MTLCommandQueue services compute + graphics; transfer is `None`),
+  Shared and Private + staging storage modes, escape hatches (`raw_device`,
+  `raw_buffer`, the queue handle). Verified on Apple M5 Max.
+- 🟨 Borsalino migration — the Vulkan path already consumes Zunesha 0.1.1
+  from crates.io (Borsalino develop, staged plan); its Metal path migrates
+  onto this backend next (the escape hatches are its Phase 3 seam).
 
 ## Relationship to Borsalino
 

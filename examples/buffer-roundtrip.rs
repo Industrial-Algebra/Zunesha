@@ -1,8 +1,14 @@
 // Copyright (C) 2026 Industrial Algebra
 // SPDX-License-Identifier: Apache-2.0
 
-// Mirrors the cfg of `zunesha::vulkan` (not macOS).
-#![cfg(all(feature = "vulkan", not(target_os = "macos")))]
+// The vulkan backend is Linux/Windows-only. Gate the body — but keep a
+// compiling `main` on every target, so any cargo-selectable feature
+// combination builds `--all-targets` everywhere (the metal examples
+// established the pattern; review r2 P3 closed this pre-existing gap).
+#![cfg_attr(
+    not(all(feature = "vulkan", not(target_os = "macos"))),
+    allow(unused_imports)
+)]
 
 //! Round-trip data through buffers on both memory strategies: write a
 //! recognizable pattern, read it back, verify byte-for-byte. Demonstrates
@@ -18,6 +24,7 @@ use std::process::ExitCode;
 
 use zunesha::{Device, MemoryStrategy};
 
+#[cfg(all(feature = "vulkan", not(target_os = "macos")))]
 fn main() -> ExitCode {
     // A pattern whose corruption is easy to spot by eye: i, i+1, i+2, ...
     let data: Vec<u8> = (0..64_u8)
@@ -63,4 +70,11 @@ fn main() -> ExitCode {
         );
     }
     ExitCode::SUCCESS
+}
+
+#[cfg(not(all(feature = "vulkan", not(target_os = "macos"))))]
+fn main() {
+    eprintln!(
+        "buffer-roundtrip: the vulkan backend is Linux/Windows-only; this is the non-Vulkan stub build."
+    );
 }
