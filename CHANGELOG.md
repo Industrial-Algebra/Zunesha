@@ -74,7 +74,7 @@ discipline Borsalino adopted for the same shapes.
   `create_device_buffer` mandatory override (forces Private regardless of
   strategy), escape hatches (`raw_device`, `raw_buffer`, `command_queue`),
   pools on every objc-minting path, and `ZUNESHA_REQUIRE_METAL` CI
-  semantics. Verified on Apple M5 Max (35 tests).
+  semantics. Verified on Apple M5 Max (18 Metal tests; 35-test suite green under `ZUNESHA_REQUIRE_METAL=1`).
 - **macOS CI** — self-hosted `test-macos` job (hantaro fleet recipe) with
   `ZUNESHA_REQUIRE_METAL=1`.
 - **Examples** — `device-info-metal`, `buffer-roundtrip-metal` (with
