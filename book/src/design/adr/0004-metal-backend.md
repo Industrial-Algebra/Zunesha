@@ -98,20 +98,25 @@ best-practices guidance is to align buffer offsets to 16 bytes. It is
 honest about being a *chosen* value: `DeviceLimits`'s doc names the field's
 meaning and the backend docs point here.
 
-### 4. No submission protocol — but a readback lock
+### 4. No submission protocol — but per-buffer readback locks
 
 `MTLCommandQueue` is documented thread-safe, so consumers dispatching their
 own command buffers on `queues().compute.raw` need no
 `with_compute_queue`-style protocol (a deliberate difference from the
 Vulkan backend; consumers read the queue handle and go).
 
-Private buffers keep one persistent Shared staging buffer each. A
-concurrent `read_buffer` of the same buffer would rewrite that shared
-mapping between the device→staging blit and the host copy — the race the
-Vulkan backend's review round 2 (P1) closed with its submission lock. The
-Metal backend closes the same race with `readback_lock`, scoped to the
-Private readback path only (creation staging buffers are freshly allocated
-per buffer and never shared).
+Private buffers keep one persistent Shared staging buffer each, and the
+lock that serializes its use **lives with the mapping** — a per-buffer
+mutex in the buffer's inner state, not a per-device one. Review round 1
+(P1) found the per-device shape unsound: two `MetalDevice` instances
+share one MTLDevice (`MTLCreateSystemDefaultDevice` returns a per-GPU
+singleton) but own different locks, so safe code could race one staging
+mapping under two locks. The per-buffer lock makes every reader — any
+thread, any device instance — contend on the lock that guards the
+mapping they actually share. Additionally, a buffer read through a
+*genuinely different* MTLDevice (multi-GPU Mac via `device_hint`) is
+rejected outright: Metal resources are per-device, so a foreign-device
+blit is invalid regardless of locking.
 
 ### 5. objc discipline (absorbed from Borsalino's crash history)
 
@@ -166,10 +171,13 @@ lands, it lands for both backends at once.
 - The 16-byte alignment floor is adopted, not queried; if Metal ever
   documents a different minimum, the value changes by editing this ADR and
   the constant, not by unifying with a query.
-- Private readback serializes on one device-wide lock (correct, slightly
-  conservative — per-buffer locks would allow unrelated Private buffers to
-  read back concurrently; unnecessary until a consumer demonstrates the
-  need).
+- Readback is a byte-copy into aligned storage, not a typed view over the
+  mapping — the honest cost of `Pod` types being arbitrarily aligned
+  (review round 1, P1: typed slices over `contents()` were UB for
+  over-aligned types).
+- A buffer read through a different MTLDevice is rejected; same-GPU
+  multi-instance reads serialize on the buffer's lock rather than being
+  rejected (the shared singleton makes them legitimate).
 
 ## Verification
 
@@ -195,6 +203,18 @@ Verified on an Apple M5 Max (this machine), 31 tests green under
 - `zero_length_buffer_follows_alignment_floor`,
   `uninit_buffer_allocates_with_logical_shape`,
   `device_hint_matches_or_falls_back`, `fresh_device_is_quiescent`.
+
+**Review round 1 (2026-10-10, gpt-6.1-sol moment) — all findings fixed in
+branch:** typed readback over `contents()` replaced by an aligned byte-copy
+(`collect_aligned`); the staging race closed by per-buffer locks plus the
+foreign-device rejection (the reviewer's exact cross-instance repro is now
+the regression `cross_device_instance_reads_are_serialized`); allocation
+arithmetic made checked (overflow errors in every profile —
+`overflowing_allocation_requests_error_cleanly`); the Linux all-targets
+build fixed by gating example bodies with a non-macOS fallback `main`
+(verified against `x86_64-unknown-linux-gnu`). The same aligned-readback
+and overflow patterns exist structurally in the Vulkan backend — recorded
+there as follow-up work, out of this backend's scope.
 
 ## Alternatives considered
 

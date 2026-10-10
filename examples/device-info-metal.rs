@@ -1,8 +1,14 @@
 // Copyright (C) 2026 Industrial Algebra
 // SPDX-License-Identifier: Apache-2.0
 
-// Mirrors the cfg of `zunesha::metal` (macOS + metal feature).
-#![cfg(all(feature = "metal", target_os = "macos"))]
+// The metal backend is macOS-only. Gate the body — but keep a
+// compiling `main` on every target, so `--features metal --all-targets`
+// builds everywhere (review r1 P2: a crate-level cfg removed `main`
+// entirely on Linux and broke the build).
+#![cfg_attr(
+    not(all(feature = "metal", target_os = "macos")),
+    allow(unused_imports)
+)]
 
 //! Print what the Metal substrate resolved on this Mac: the ADR-0004
 //! queue shape, limits, memory strategy, and effective buffer placement.
@@ -15,6 +21,7 @@ use std::process::ExitCode;
 
 use zunesha::{Device, InitRequest};
 
+#[cfg(all(feature = "metal", target_os = "macos"))]
 fn main() -> ExitCode {
     let mut request = InitRequest::prefer_graphics();
     if let Ok(hint) = std::env::var("ZUNESHA_TEST_DEVICE") {
@@ -54,4 +61,11 @@ fn main() -> ExitCode {
         device.buffer_placement()
     );
     ExitCode::SUCCESS
+}
+
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+fn main() {
+    eprintln!(
+        "device-info-metal: the metal backend is macOS-only; this is the non-macOS stub build."
+    );
 }

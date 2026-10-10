@@ -94,13 +94,46 @@ const STORAGE_MODE_SHARED: u64 = 0;
 /// device-local + staging design).
 const STORAGE_MODE_PRIVATE: u64 = 32;
 
-/// Round `value` up to a multiple of `alignment` (power of two).
-fn align_up(value: usize, alignment: usize) -> usize {
+/// Round `value` up to a multiple of `alignment` (power of two), or
+/// `None` on overflow. Checked wherever allocation sizes are computed
+/// (review r1 P1-3: the unchecked variant panicked in debug builds and
+/// silently wrapped in release).
+fn checked_align_up(value: usize, alignment: usize) -> Option<usize> {
     if alignment == 0 {
-        value
+        Some(value)
     } else {
-        (value + alignment - 1) & !(alignment - 1)
+        Some((value.checked_add(alignment - 1)?) & !(alignment - 1))
     }
+}
+
+/// Copy `byte_len` logical bytes out of a Metal `contents()` mapping into
+/// a properly aligned, owned `Vec<T>` (review r1 P1-1).
+///
+/// `Pod` types may require more alignment than Metal guarantees for its
+/// mappings, so a typed slice over the mapping is unsound — this reads the
+/// mapping as raw bytes (align 1, always valid) and copy-constructs each
+/// element into `MaybeUninit` slots that are aligned by construction.
+/// Preserves floor semantics: `byte_len / size_of::<T>()` elements.
+fn collect_aligned<T: bytemuck::Pod>(mapped: *const c_void, byte_len: usize) -> Vec<T> {
+    let elem = std::mem::size_of::<T>();
+    if elem == 0 {
+        return Vec::new();
+    }
+    let count = byte_len / elem;
+    let mut out = Vec::with_capacity(count);
+    let src = mapped as *const u8;
+    for i in 0..count {
+        // Safety: element i's source bytes are in bounds (byte_len ≥
+        // (i+1)·elem by the floor division, and the allocation is
+        // alignment-floored ≥ byte_len); `Pod` implies `AnyBitPattern`,
+        // so any bit pattern is a valid `T` and `assume_init` is sound.
+        let mut slot = std::mem::MaybeUninit::<T>::uninit();
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.add(i * elem), slot.as_mut_ptr() as *mut u8, elem);
+            out.push(slot.assume_init());
+        }
+    }
+    out
 }
 
 // ── Buffer inner type ─────────────────────────────────────────────
@@ -121,6 +154,16 @@ struct MetalBufferInner {
     /// Alignment-floored allocation size (staging copies move this many
     /// bytes, mirroring the Vulkan backend's `size` field).
     size: usize,
+    /// The MTLDevice that created this buffer (review r1 P1-2). Metal
+    /// resources are per-device; `read_buffer` rejects buffers created
+    /// by a different `MetalDevice` before touching the staging mapping.
+    device: *mut c_void,
+    /// Serializes Private readback for **this buffer** (review r1 P1-2):
+    /// the device→staging blit and the host copy run under this per-buffer
+    /// lock, so every reader of the shared staging mapping contends on
+    /// the lock that lives with that mapping — not on a per-device lock a
+    /// second device instance would bypass.
+    readback_lock: std::sync::Mutex<()>,
 }
 
 // Safety: opaque backend handles; all GPU access is serialized through
@@ -170,15 +213,6 @@ pub struct MetalDevice {
     memory_strategy: MemoryStrategy,
     placement: MemoryPlacement,
     limits: DeviceLimits,
-    /// Serializes Private-buffer readback staging. *Not* needed for
-    /// `MTLCommandQueue` safety — Apple documents the queue itself as
-    /// thread-safe — but each Private buffer carries one persistent Shared
-    /// staging mapping; a concurrent `read_buffer` of the same buffer
-    /// would rewrite that mapping mid-host-copy (the Vulkan backend's
-    /// review round 2, P1 race, transplanted). Scoped to the readback
-    /// path only; creation staging buffers are freshly allocated per
-    /// buffer and never shared.
-    readback_lock: std::sync::Mutex<()>,
     epoch: GpuEpochTracker,
 }
 
@@ -195,9 +229,10 @@ impl Drop for MetalDevice {
 
 // Safety: MTLDevice and MTLCommandQueue are documented thread-safe; the
 // epoch tracker is atomics; the only shared mutable substrate state (the
-// per-buffer staging mappings) is guarded by `readback_lock`. Consumers
-// (Borsalino) share one device behind an `Arc` — same contract as
-// `VulkanDevice`.
+// per-buffer staging mappings) is guarded by each buffer's own
+// `readback_lock`, and foreign-device reads are rejected outright
+// (review r1 P1-2). Consumers (Borsalino) share one device behind an
+// `Arc` — same contract as `VulkanDevice`.
 unsafe impl Send for MetalDevice {}
 unsafe impl Sync for MetalDevice {}
 
@@ -280,7 +315,15 @@ impl MetalDevice {
         let aligned = if byte_len == 0 {
             alignment
         } else {
-            align_up(byte_len, alignment)
+            // Checked rounding — an overflowing request must error, not
+            // panic (debug) or wrap (release); review r1 P1-3.
+            checked_align_up(byte_len, alignment).ok_or_else(|| {
+                DeviceError::BufferCreationFailed {
+                    message: format!(
+                        "allocation of {byte_len} bytes (aligned to {alignment}) overflows usize"
+                    ),
+                }
+            })?
         };
         let use_private = force_private || self.placement == MemoryPlacement::DeviceLocal;
 
@@ -335,6 +378,8 @@ impl MetalDevice {
                 staging: None,
                 mapped: contents,
                 size: aligned,
+                device: self.device,
+                readback_lock: std::sync::Mutex::new(()),
             });
             Ok(crate::Buffer {
                 raw: Box::into_raw(inner) as *mut c_void,
@@ -398,6 +443,8 @@ impl MetalDevice {
                 staging: Some(staging),
                 mapped: stg_contents,
                 size: aligned,
+                device: self.device,
+                readback_lock: std::sync::Mutex::new(()),
             });
             Ok(crate::Buffer {
                 raw: Box::into_raw(inner) as *mut c_void,
@@ -514,7 +561,6 @@ impl MetalDevice {
                 limits: DeviceLimits {
                     min_storage_buffer_offset_alignment: 16,
                 },
-                readback_lock: std::sync::Mutex::new(()),
                 epoch: GpuEpochTracker::new(),
             })
         })
@@ -598,7 +644,17 @@ impl Device for MetalDevice {
     }
 
     fn create_buffer_uninit<T: bytemuck::Pod>(&self, len: usize) -> Result<crate::Buffer> {
-        self.buffer_new(len * std::mem::size_of::<T>(), None, false)
+        // Checked multiply — an overflowing request must error in every
+        // build profile (review r1 P1-3), not panic or wrap.
+        let byte_len = len.checked_mul(std::mem::size_of::<T>()).ok_or_else(|| {
+            DeviceError::BufferCreationFailed {
+                message: format!(
+                    "allocation of {len} × {} elements overflows usize",
+                    std::mem::size_of::<T>()
+                ),
+            }
+        })?;
+        self.buffer_new(byte_len, None, false)
     }
 
     /// Forces the Private + staging path regardless of the negotiated
@@ -618,48 +674,70 @@ impl Device for MetalDevice {
     /// Uninitialised variant of
     /// [`create_device_buffer`](Self::create_device_buffer).
     fn create_device_buffer_uninit<T: bytemuck::Pod>(&self, len: usize) -> Result<crate::Buffer> {
-        self.buffer_new(len * std::mem::size_of::<T>(), None, true)
+        // Checked multiply — review r1 P1-3, same as `create_buffer_uninit`.
+        let byte_len = len.checked_mul(std::mem::size_of::<T>()).ok_or_else(|| {
+            DeviceError::BufferCreationFailed {
+                message: format!(
+                    "allocation of {len} × {} elements overflows usize",
+                    std::mem::size_of::<T>()
+                ),
+            }
+        })?;
+        self.buffer_new(byte_len, None, true)
     }
 
     fn read_buffer<T: bytemuck::Pod>(&self, buffer: &crate::Buffer) -> Result<Vec<T>> {
         // Safety: `raw` was produced by `Box::into_raw::<MetalBufferInner>`
         // in `buffer_new` and remains valid while `buffer` is alive.
         let inner = unsafe { &*(buffer.raw as *const MetalBufferInner) };
+        // Ownership rule (review r1 P1-2): Metal resources are per-device.
+        // A buffer created by a different MTLDevice (reachable on
+        // multi-GPU Macs via `device_hint`) must not be read through this
+        // one — its blit would target foreign resources. Note
+        // `MTLCreateSystemDefaultDevice` returns a per-GPU singleton, so
+        // two `MetalDevice` instances on one GPU share the pointer and
+        // pass this check — their readers are serialized instead by the
+        // buffer's own `readback_lock` below (the lock lives with the
+        // mapping it guards).
+        if !core::ptr::eq(self.device, inner.device) {
+            return Err(DeviceError::BufferReadFailed {
+                message: "buffer was not created by this device (Metal resources are per-device)"
+                    .into(),
+            });
+        }
+        if std::mem::size_of::<T>() == 0 {
+            return Ok(Vec::new());
+        }
         if inner.mapped.is_null() {
             return Err(DeviceError::BufferReadFailed {
                 message: "buffer has no CPU mapping (no staging)".into(),
             });
         }
-        let count = if std::mem::size_of::<T>() == 0 {
-            0
-        } else {
-            buffer.len / std::mem::size_of::<T>()
-        };
 
         if inner.staging.is_none() {
-            // Shared: read the mapping directly. `contents()` is borrowed
-            // (R5.4) — copy out through the slice, never release it.
-            let src = inner.mapped as *const T;
-            return Ok(unsafe { std::slice::from_raw_parts(src, count).to_vec() });
+            // Shared: copy the mapping out as raw bytes into aligned
+            // storage — a typed slice over the mapping would be unsound
+            // for over-aligned `Pod` types (review r1 P1-1). `contents()`
+            // stays borrowed (R5.4) — read-only, never released.
+            return Ok(collect_aligned(inner.mapped, buffer.len));
         }
 
         // Private: device → staging blit, wait, then host copy — BOTH
-        // under the readback lock. The staging mapping is shared
-        // per-buffer: releasing the lock between the blit and the host
-        // copy would let a concurrent `read_buffer` of the same buffer
-        // rewrite the mapping mid-copy (the Vulkan backend's review
-        // round 2, P1 race, transplanted — see `readback_lock`).
-        let guard = self
+        // under the buffer's own lock. The staging mapping is shared by
+        // every reader of this buffer; the lock lives with the mapping,
+        // so same-device concurrency and any legitimate re-entrant path
+        // serialize correctly (review r1 P1-2 — the Vulkan backend's
+        // review round 2, P1 race, transplanted and then some).
+        let guard = inner
             .readback_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Safety: `staging` is a valid MTLBuffer of `inner.size` bytes,
         // and the blit completes synchronously before the copy below.
         unsafe { self.blit_copy(inner.buffer, inner.staging.unwrap(), inner.size)? };
-        let src = inner.mapped as *const T;
         // Safety: `mapped` is the staging `contents()` — borrowed (R5.4),
-        // valid while the staging MTLBuffer (owned by `inner`) lives.
-        let out = unsafe { std::slice::from_raw_parts(src, count).to_vec() };
+        // valid for `buffer.len` logical bytes while `inner` lives.
+        let out = collect_aligned(inner.mapped, buffer.len);
         drop(guard);
         Ok(out)
     }
@@ -1032,6 +1110,112 @@ mod tests {
             h.join()
                 .expect("no thread panicked under the readback lock");
         }
+    }
+
+    /// Review r1 P1-3: overflowing allocation requests must error cleanly in
+    /// EVERY build profile — debug must not panic on the multiply/align, and
+    /// release must not wrap to a bogus `Ok` (observed: `usize::MAX` u8
+    /// elements wrapped to a 0-byte buffer in release).
+    #[test]
+    #[serial]
+    fn overflowing_allocation_requests_error_cleanly() {
+        let Some(device) = test_device() else { return };
+        for res in [
+            device.create_buffer_uninit::<u64>(usize::MAX / 8 + 1),
+            device.create_buffer_uninit::<u8>(usize::MAX),
+            device.create_device_buffer_uninit::<u8>(usize::MAX),
+        ] {
+            match res {
+                Err(DeviceError::BufferCreationFailed { .. }) => {}
+                other => panic!("overflowing request must error, got {other:?}"),
+            }
+        }
+    }
+
+    /// A huge-but-non-overflowing allocation fails cleanly at the Metal
+    /// layer (null buffer → error, no crash), and the device stays usable
+    /// afterwards — failure paths release what they own (R5.5 evidence).
+    #[test]
+    #[serial]
+    fn oversized_allocation_fails_cleanly() {
+        let Some(device) = test_device() else { return };
+        assert!(matches!(
+            device.create_buffer_uninit::<u8>(1 << 48),
+            Err(DeviceError::BufferCreationFailed { .. })
+        ));
+        // Device still functional after the failure.
+        let ok = device
+            .create_buffer(&[1u32, 2, 3])
+            .expect("device usable after failure");
+        let back: Vec<u32> = device.read_buffer(&ok).unwrap();
+        assert_eq!(back, vec![1, 2, 3]);
+    }
+
+    /// Review r1 P1-2: the staging-mapping race across `MetalDevice`
+    /// instances. `MTLCreateSystemDefaultDevice` returns a per-GPU
+    /// singleton, so two independently initialized devices share one
+    /// MTLDevice (but own different command queues) — the buffer's own
+    /// `readback_lock` must serialize their reads of the single staging
+    /// mapping: every read exact, no panic. This is the reviewer's exact
+    /// repro shape, now pinned as the regression.
+    ///
+    /// A buffer read through a *genuinely different* MTLDevice (discrete
+    /// multi-GPU Mac, reachable via `device_hint`) is rejected by the
+    /// ownership check in `read_buffer` — untestable on single-GPU
+    /// hardware, guarded by the device-pointer comparison.
+    #[test]
+    #[serial]
+    fn cross_device_instance_reads_are_serialized() {
+        let Some(a) = test_device() else { return };
+        let Some(b) = test_device() else { return };
+        let buffer = a
+            .create_device_buffer(&vec![42u8; 64 * 1024])
+            .expect("create");
+        let expected = vec![42u8; 64 * 1024];
+        let buffer_ref = &buffer;
+        std::thread::scope(|s| {
+            for device in [&a, &b] {
+                let expected = expected.clone();
+                s.spawn(move || {
+                    for _ in 0..100 {
+                        let back: Vec<u8> = device.read_buffer(buffer_ref).unwrap();
+                        assert_eq!(back, expected);
+                    }
+                });
+            }
+        });
+    }
+
+    /// Review r1 P1-2 (same-device face): four threads reading the SAME
+    /// Private buffer through one shared device must serialize on the
+    /// buffer's own staging mapping — every read exact, no panic. Pins the
+    /// per-buffer readback lock (replaces the prior per-thread-buffer
+    /// shape, which never contended one staging mapping).
+    #[test]
+    #[serial]
+    fn same_buffer_concurrent_reads_are_serialized() {
+        let device = match MetalDevice::init_with_strategy(MemoryStrategy::DeviceLocal) {
+            Ok(d) => std::sync::Arc::new(d),
+            Err(e) => {
+                eprintln!("skipping: no Metal device ({e})");
+                return;
+            }
+        };
+        let payload: Vec<u32> = (0..1024u32).map(|i| i.wrapping_mul(2654435761)).collect();
+        let buffer = device.create_device_buffer(&payload).unwrap();
+        let buffer_ref = &buffer;
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                let device = std::sync::Arc::clone(&device);
+                let expected = payload.clone();
+                s.spawn(move || {
+                    for _ in 0..25 {
+                        let back: Vec<u32> = device.read_buffer(buffer_ref).unwrap();
+                        assert_eq!(back, expected);
+                    }
+                });
+            }
+        });
     }
 
     /// `device_hint` matching: `MTLCopyAllDevices` name matching wins over
