@@ -856,8 +856,9 @@ impl VulkanDevice {
                 if byte_len > 0 {
                     unsafe { ptr::copy_nonoverlapping(src, stg_mapped, byte_len as usize) };
                     // Same failure discipline: free BOTH allocations if the
-                    // upload transfer fails.
-                    if (self.with_compute_queue(|queue| unsafe {
+                    // upload transfer fails, then propagate the original
+                    // transfer error (review r1: don't discard the detail).
+                    if let Err(e) = self.with_compute_queue(|queue| unsafe {
                         one_shot_transfer(&self.device, self.command_pool, queue, |cmd| {
                             let copy = vk::BufferCopy::default().size(aligned);
                             self.device.cmd_copy_buffer(
@@ -867,18 +868,14 @@ impl VulkanDevice {
                                 std::slice::from_ref(&copy),
                             );
                         })
-                    }))
-                    .is_err()
-                    {
+                    }) {
                         unsafe {
                             self.device.destroy_buffer(stg_buf, None);
                             self.device.free_memory(stg_mem, None);
                             self.device.destroy_buffer(dev_buf, None);
                             self.device.free_memory(dev_mem, None);
                         }
-                        return Err(DeviceError::BufferCreationFailed {
-                            message: "device-local upload transfer failed".into(),
-                        });
+                        return Err(e);
                     }
                 }
             }
