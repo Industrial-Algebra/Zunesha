@@ -640,21 +640,74 @@ fn align_up(value: vk::DeviceSize, alignment: vk::DeviceSize) -> vk::DeviceSize 
 struct TransferProtocol {
     unconfirmed: std::sync::atomic::AtomicBool,
     submit_lock: std::sync::Mutex<()>,
+    /// Unique identity for per-protocol reentrancy tracking (r6 P1: a
+    /// thread-local depth keyed only by THREAD would let a thread
+    /// holding device1's protocol skip device2's lock on a nested
+    /// entry — losing cross-device exclusion).
+    id: u64,
 }
+
+static PROTOCOL_IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 thread_local! {
     /// Per-thread nesting depth inside [`VulkanDevice::with_compute_queue`]
-    /// (or the substrate's internal submission paths). `> 0` ⇒ this thread
-    /// holds `submit_lock`, so BOTH a nested protocol entry (the
+    /// (or the substrate's internal submission paths), keyed BY PROTOCOL
+    /// ID (r6 P1: thread-global depth loses cross-device exclusion).
+    /// `depth(protocol) > 0` ⇒ this thread holds THAT protocol's
+    /// `submit_lock`, so BOTH a nested entry of the SAME protocol (the
     /// substrate's own device-local staging transfer) and a quiesce
-    /// reached re-entrantly (a buffer dropping at closure end) skip
-    /// re-acquiring the non-reentrant mutex — the cross-thread mutual
-    /// exclusion it exists to provide is already held by this thread
-    /// (review r5 P1; nested-entry deadlock pre-existing since 0.1.1).
-    static PROTOCOL_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// reached re-entrantly (a buffer dropping at closure end) skip the
+    /// non-reentrant re-acquisition — the cross-thread mutual exclusion
+    /// it exists to provide is already held by this thread. Entry of a
+    /// DIFFERENT protocol (another device) still acquires normally.
+    /// (Reviews r5+r6 P1s; nested-entry deadlock pre-existing since 0.1.1.)
+    static PROTOCOL_DEPTH: std::cell::RefCell<std::collections::HashMap<u64, u32>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 impl TransferProtocol {
+    /// This thread's nesting depth in THIS protocol (0 ⇒ not held).
+    fn held_by_current_thread(&self) -> bool {
+        PROTOCOL_DEPTH.with(|m| m.borrow().get(&self.id).is_some_and(|&d| d > 0))
+    }
+
+    /// Enter the protocol on this thread: acquire the cross-thread lock
+    /// unless this thread already holds it (per-protocol reentrancy),
+    /// then record the nesting. The `Pop` guard unwinds the record
+    /// BEFORE the lock releases, preserving the invariant above.
+    fn enter<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _guard = if self.held_by_current_thread() {
+            None
+        } else {
+            Some(
+                self.submit_lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )
+        };
+        PROTOCOL_DEPTH.with(|m| {
+            let mut m = m.borrow_mut();
+            *m.entry(self.id).or_insert(0) += 1;
+        });
+        struct Pop(u64);
+        impl Drop for Pop {
+            fn drop(&mut self) {
+                PROTOCOL_DEPTH.with(|m| {
+                    let mut m = m.borrow_mut();
+                    match m.get_mut(&self.0) {
+                        Some(d) if *d > 1 => *d -= 1,
+                        Some(_) => {
+                            m.remove(&self.0);
+                        }
+                        None => {}
+                    }
+                });
+            }
+        }
+        let _pop = Pop(self.id);
+        f()
+    }
+
     /// Quiesce-or-leak, SERIALIZED with submissions via `submit_lock`.
     /// Returns `true` when destruction is safe (no unconfirmed
     /// submission, or `device_wait_idle` succeeded — which also clears
@@ -669,14 +722,14 @@ impl TransferProtocol {
     /// prerequisites of the caller (review r5 P3).
     fn quiesce(&self, device: &ash::Device) -> bool {
         use std::sync::atomic::Ordering;
-        // Reentrancy: if this thread is inside with_compute_queue it
-        // already holds submit_lock — acquiring it again would deadlock
+        // Reentrancy: if this thread already holds THIS protocol's
+        // submit_lock (nested entry), acquiring it again would deadlock
         // (std's Mutex is not reentrant), and no other thread can submit
-        // meanwhile, so the load→wait→clear atomicity holds without the
-        // re-acquisition.
-        let reentrant = PROTOCOL_DEPTH.get() > 0;
+        // on it meanwhile, so the load→wait→clear atomicity holds
+        // without the re-acquisition. A DIFFERENT protocol's depth does
+        // NOT exempt this one (r6 P1).
         // Poison-steal: teardown must proceed after a submitter panicked.
-        let _guard = if reentrant {
+        let _guard = if self.held_by_current_thread() {
             None
         } else {
             Some(
@@ -968,6 +1021,7 @@ impl VulkanDevice {
             protocol: std::sync::Arc::new(TransferProtocol {
                 unconfirmed: std::sync::atomic::AtomicBool::new(false),
                 submit_lock: std::sync::Mutex::new(()),
+                id: PROTOCOL_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             }),
         })
     }
@@ -1164,39 +1218,11 @@ impl VulkanDevice {
     /// The lock is held only for the closure's duration; it is never held
     /// across a long-running GPU wait started elsewhere.
     pub fn with_compute_queue<R>(&self, f: impl FnOnce(vk::Queue) -> R) -> R {
-        // The lock's purpose is CROSS-THREAD exclusion of the shared
-        // queue/pool; this thread re-entering the protocol must NOT
-        // re-acquire the non-reentrant mutex. Re-entry is real and
-        // pre-existing since 0.1.1: the substrate's own buffer creation
-        // (device-local staging transfer) and a buffer's teardown quiesce
-        // both run inside a consumer's closure (found via review r5 P1's
-        // reproduction). PROTOCOL_DEPTH > 0 ⇒ this thread already holds
-        // submit_lock.
-        let _guard = if PROTOCOL_DEPTH.get() > 0 {
-            None
-        } else {
-            // Poisoning only means a submitter panicked mid-closure; the
-            // queue state is still usable (Vulkan object state is not
-            // corrupted by a host panic between calls), so steal the lock
-            // and continue.
-            Some(
-                self.protocol
-                    .submit_lock
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-            )
-        };
-        // Depth resets on unwind via Drop, BEFORE any held lock releases,
-        // keeping the invariant "depth > 0 ⇒ this thread holds the lock".
-        struct DepthReset;
-        impl Drop for DepthReset {
-            fn drop(&mut self) {
-                PROTOCOL_DEPTH.set(PROTOCOL_DEPTH.get().saturating_sub(1));
-            }
-        }
-        PROTOCOL_DEPTH.set(PROTOCOL_DEPTH.get() + 1);
-        let _depth = DepthReset;
-        f(self.compute_queue)
+        // Per-protocol reentrancy + cross-thread exclusion live in
+        // [`TransferProtocol::enter`] (reviews r5+r6 P1s: same-device
+        // nested entry must not deadlock; another device's lock must
+        // still be acquired).
+        self.protocol.enter(|| f(self.compute_queue))
     }
 }
 
@@ -1566,6 +1592,72 @@ mod tests {
     /// submit lock (its Drop quiesce skips the re-acquisition because
     /// this thread already holds the protocol). Timeout-guarded so a
     /// regression FAILS rather than hangs.
+    /// Review r6 P1 regression: reentrancy must be keyed per PROTOCOL
+    /// (device), not per thread — a thread holding device1's protocol
+    /// must NOT skip device2's lock on a nested entry. Deterministic:
+    /// thread B holds d2's protocol and parks; thread A (inside d1's
+    /// closure) enters d2's closure — it must BLOCK until B releases.
+    /// A global depth marker would let A enter concurrently (the bug).
+    #[test]
+    #[serial]
+    fn nested_cross_device_entry_still_excludes() {
+        let d1 = match VulkanDevice::init() {
+            Ok(d) => std::sync::Arc::new(d),
+            Err(e) => {
+                eprintln!("skipping: no Vulkan device ({e})");
+                return;
+            }
+        };
+        let d2 = match VulkanDevice::init() {
+            Ok(d) => std::sync::Arc::new(d),
+            Err(e) => {
+                eprintln!("skipping: second device init ({e})");
+                return;
+            }
+        };
+
+        let (b_entered_tx, b_entered_rx) = std::sync::mpsc::channel::<()>();
+        let (b_release_tx, b_release_rx) = std::sync::mpsc::channel::<()>();
+        let (a_done_tx, a_done_rx) = std::sync::mpsc::channel::<()>();
+
+        let db = std::sync::Arc::clone(&d2);
+        let holder = std::thread::spawn(move || {
+            db.with_compute_queue(|_| {
+                b_entered_tx.send(()).unwrap();
+                let _ = b_release_rx.recv(); // hold d2's protocol open
+            });
+        });
+        b_entered_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("holder failed to enter d2");
+
+        let (da, db2) = (std::sync::Arc::clone(&d1), std::sync::Arc::clone(&d2));
+        let racer = std::thread::spawn(move || {
+            da.with_compute_queue(|_| {
+                db2.with_compute_queue(|_| ());
+            });
+            a_done_tx.send(()).unwrap();
+        });
+
+        // The racer must still be BLOCKED on d2's lock while the holder
+        // keeps it: a completed entry here is the lost-exclusion bug.
+        assert!(
+            a_done_rx
+                .recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "nested cross-device entry skipped device2's lock (reentrancy not per-protocol)"
+        );
+        b_release_tx.send(()).unwrap();
+        assert!(
+            a_done_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .is_ok(),
+            "racer did not enter d2 after the holder released"
+        );
+        holder.join().unwrap();
+        racer.join().unwrap();
+    }
+
     #[test]
     #[serial]
     fn buffer_drop_inside_with_compute_queue_does_not_deadlock() {

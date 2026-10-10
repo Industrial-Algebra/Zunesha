@@ -43,6 +43,13 @@ step now frees what was created before it propagates:
   via a thread-local depth marker. Regression:
   `buffer_drop_inside_with_compute_queue_does_not_deadlock`
   (timeout-guarded, RTX 5080).
+- Reentrancy is keyed PER PROTOCOL (r6 P1): a thread holding device1's
+  protocol must not skip device2's lock on a nested entry — the depth
+  is a thread-local map keyed by a unique protocol id, so cross-device
+  exclusion survives multi-device processes. Regression:
+  `nested_cross_device_entry_still_excludes` (deterministic
+  channel-ordered two-device test, RTX 5080; failed against the
+  thread-global marker).
 - `allocate_buffer`: memory-type lookup, `vkAllocateMemory`,
   `vkBindBufferMemory`, and `vkMapMemory` failures destroy the buffer
   (and free the memory once allocated).
