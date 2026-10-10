@@ -54,3 +54,11 @@ required-features = ["vulkan"]
 
 # Still pending:
 # verify will add: karpal-verify, karpal-proof (optional).
+
+[[example]]
+name = "device-info-metal"
+required-features = ["metal"]
+
+[[example]]
+name = "buffer-roundtrip-metal"
+required-features = ["metal"]
