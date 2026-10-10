@@ -1294,18 +1294,10 @@ mod tests {
         }
     }
 
-    /// `create_device_buffer` must allocate device-local even when the
-    /// device strategy is forced `Unified` — the documented trait contract
-    /// for GPU-resident data (Borsalino's own implementation takes the
-    /// host-visible path there instead, diverging from its trait docs;
-    /// see the Borsalino migration plan §5.1 for the full relationship).
-    ///
-    /// Observable via internals: a device-local allocation carries a staging
-    /// buffer; the strategy-respecting `create_buffer` under `Unified` does
-    /// not. Both must still upload and read back exactly.
     /// Safe code can share one `Arc<VulkanDevice>` across threads; the
-    /// staging transfers those threads trigger must therefore be internally
-    /// serialized (the `submit_lock` protocol — review round 1's P1).
+    /// staging transfers those threads trigger must therefore be
+    /// internally serialized (the `submit_lock` protocol — review round
+    /// 1's P1, with the readback copy inside the lock per round 2's).
     /// Regression: concurrent device-local buffer creation + readback from
     /// four threads round-trips exactly and does not deadlock.
     #[test]
@@ -1335,6 +1327,15 @@ mod tests {
         }
     }
 
+    /// `create_device_buffer` must allocate device-local even when the
+    /// device strategy is forced `Unified` — the documented trait contract
+    /// for GPU-resident data (Borsalino's own implementation takes the
+    /// host-visible path there instead, diverging from its trait docs;
+    /// see the Borsalino migration plan §5.1 for the full relationship).
+    ///
+    /// Observable via internals: a device-local allocation carries a staging
+    /// buffer; the strategy-respecting `create_buffer` under `Unified` does
+    /// not. Both must still upload and read back exactly.
     #[test]
     #[serial]
     fn device_buffer_forces_device_local_under_unified_strategy() {
