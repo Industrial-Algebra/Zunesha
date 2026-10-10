@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — allocation-failure cleanup (2026-10-10)
+
+Found by the Borsalino Phase-2 review (PR #60 round 1): the buffer
+creation paths leaked partial state on allocation failure. Every failure
+step now frees what was created before it propagates:
+
+- `buffer_new` (device-local branch): staging-allocation failure frees
+  the device buffer+memory; upload-transfer failure frees both
+  allocations.
+- `allocate_buffer`: memory-type lookup, `vkAllocateMemory`,
+  `vkBindBufferMemory`, and `vkMapMemory` failures destroy the buffer
+  (and free the memory once allocated).
+- `allocate_device_local_buffer`: same for memory-type lookup,
+  `vkAllocateMemory`, and `vkBindBufferMemory`.
+
+Runtime fault injection is not feasible in a unit test (ash exposes no
+mock layer and a test-only allocator seam is out of patch scope); the
+cleanup is verified by construction and code review, matching the
+discipline Borsalino adopted for the same shapes.
+
 ## [0.1.1] — 2026-10-10
 
 ### Fixed — review round 2 (2026-10-10)

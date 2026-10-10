@@ -343,41 +343,58 @@ unsafe fn allocate_buffer(
     let mut flags = vk::MemoryPropertyFlags::HOST_VISIBLE
         | vk::MemoryPropertyFlags::HOST_COHERENT
         | vk::MemoryPropertyFlags::HOST_CACHED;
-    let mem_type_index =
-        find_memory_type_index(memory_properties, mem_reqs.memory_type_bits, flags).or_else(
-            |_| {
+    let mem_type_index = {
+        let preferred = find_memory_type_index(memory_properties, mem_reqs.memory_type_bits, flags);
+        match preferred {
+            Ok(idx) => Ok(idx),
+            Err(e) => {
                 flags =
                     vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
                 find_memory_type_index(memory_properties, mem_reqs.memory_type_bits, flags)
-            },
-        )?;
+                    .inspect_err(|_| {
+                        // Free partial state: the buffer created above.
+                        unsafe { device.destroy_buffer(buffer, None) };
+                    })
+                    .map_err(|_| e)
+            }
+        }
+    }?;
 
     let alloc_info = vk::MemoryAllocateInfo::default()
         .allocation_size(mem_reqs.size)
         .memory_type_index(mem_type_index);
 
-    let memory = unsafe {
-        device.allocate_memory(&alloc_info, None).map_err(|e| {
-            DeviceError::BufferCreationFailed {
+    let memory = match unsafe { device.allocate_memory(&alloc_info, None) } {
+        Ok(memory) => memory,
+        Err(e) => {
+            unsafe { device.destroy_buffer(buffer, None) };
+            return Err(DeviceError::BufferCreationFailed {
                 message: format!("vkAllocateMemory: {e}"),
-            }
-        })?
+            });
+        }
     };
 
-    unsafe {
-        device.bind_buffer_memory(buffer, memory, 0).map_err(|e| {
-            DeviceError::BufferCreationFailed {
-                message: format!("vkBindBufferMemory: {e}"),
-            }
-        })?;
+    if let Err(e) = unsafe { device.bind_buffer_memory(buffer, memory, 0) } {
+        unsafe {
+            device.free_memory(memory, None);
+            device.destroy_buffer(buffer, None);
+        }
+        return Err(DeviceError::BufferCreationFailed {
+            message: format!("vkBindBufferMemory: {e}"),
+        });
     }
 
-    let mapped = unsafe {
-        device
-            .map_memory(memory, 0, size, vk::MemoryMapFlags::empty())
-            .map_err(|e| DeviceError::BufferCreationFailed {
+    let mapped = match unsafe { device.map_memory(memory, 0, size, vk::MemoryMapFlags::empty()) } {
+        Ok(mapped) => mapped,
+        Err(e) => {
+            unsafe {
+                device.free_memory(memory, None);
+                device.destroy_buffer(buffer, None);
+            }
+            return Err(DeviceError::BufferCreationFailed {
                 message: format!("vkMapMemory: {e}"),
-            })?
+            });
+        }
     };
 
     Ok((buffer, memory, mapped))
@@ -413,26 +430,34 @@ unsafe fn allocate_device_local_buffer(
         memory_properties,
         mem_reqs.memory_type_bits,
         vk::MemoryPropertyFlags::DEVICE_LOCAL,
-    )?;
+    )
+    .inspect_err(|_| {
+        // Free partial state: the buffer created above.
+        unsafe { device.destroy_buffer(buffer, None) };
+    })?;
 
     let alloc_info = vk::MemoryAllocateInfo::default()
         .allocation_size(mem_reqs.size)
         .memory_type_index(mem_type_index);
 
-    let memory = unsafe {
-        device.allocate_memory(&alloc_info, None).map_err(|e| {
-            DeviceError::BufferCreationFailed {
+    let memory = match unsafe { device.allocate_memory(&alloc_info, None) } {
+        Ok(memory) => memory,
+        Err(e) => {
+            unsafe { device.destroy_buffer(buffer, None) };
+            return Err(DeviceError::BufferCreationFailed {
                 message: format!("vkAllocateMemory(device-local): {e}"),
-            }
-        })?
+            });
+        }
     };
 
-    unsafe {
-        device.bind_buffer_memory(buffer, memory, 0).map_err(|e| {
-            DeviceError::BufferCreationFailed {
-                message: format!("vkBindBufferMemory(device-local): {e}"),
-            }
-        })?;
+    if let Err(e) = unsafe { device.bind_buffer_memory(buffer, memory, 0) } {
+        unsafe {
+            device.free_memory(memory, None);
+            device.destroy_buffer(buffer, None);
+        }
+        return Err(DeviceError::BufferCreationFailed {
+            message: format!("vkBindBufferMemory(device-local): {e}"),
+        });
     }
 
     Ok((buffer, memory))
@@ -807,18 +832,32 @@ impl VulkanDevice {
             let (dev_buf, dev_mem) = unsafe {
                 allocate_device_local_buffer(&self.device, &self.memory_properties, aligned, usage)?
             };
-            let (stg_buf, stg_mem, stg_mapped) = unsafe {
+            // Review (Borsalino PR #60 r1, substrate half): if the staging
+            // allocation fails, free the device allocation before
+            // propagating — the owning inner does not exist yet.
+            let (stg_buf, stg_mem, stg_mapped) = match unsafe {
                 allocate_buffer(
                     &self.device,
                     &self.memory_properties,
                     aligned,
                     vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
-                )?
+                )
+            } {
+                Ok(alloc) => alloc,
+                Err(e) => {
+                    unsafe {
+                        self.device.destroy_buffer(dev_buf, None);
+                        self.device.free_memory(dev_mem, None);
+                    }
+                    return Err(e);
+                }
             };
             if let Some(src) = data {
                 if byte_len > 0 {
                     unsafe { ptr::copy_nonoverlapping(src, stg_mapped, byte_len as usize) };
-                    self.with_compute_queue(|queue| unsafe {
+                    // Same failure discipline: free BOTH allocations if the
+                    // upload transfer fails.
+                    if (self.with_compute_queue(|queue| unsafe {
                         one_shot_transfer(&self.device, self.command_pool, queue, |cmd| {
                             let copy = vk::BufferCopy::default().size(aligned);
                             self.device.cmd_copy_buffer(
@@ -828,7 +867,19 @@ impl VulkanDevice {
                                 std::slice::from_ref(&copy),
                             );
                         })
-                    })?;
+                    }))
+                    .is_err()
+                    {
+                        unsafe {
+                            self.device.destroy_buffer(stg_buf, None);
+                            self.device.free_memory(stg_mem, None);
+                            self.device.destroy_buffer(dev_buf, None);
+                            self.device.free_memory(dev_mem, None);
+                        }
+                        return Err(DeviceError::BufferCreationFailed {
+                            message: "device-local upload transfer failed".into(),
+                        });
+                    }
                 }
             }
             (dev_buf, dev_mem, stg_mapped, Some(stg_buf), Some(stg_mem))
