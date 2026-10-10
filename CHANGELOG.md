@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-10-10
+
+### Fixed — review round 2 (2026-10-10)
+
+- `read_buffer` holds the submission lock through **both** the
+  device→staging transfer and the host copy of the shared per-buffer
+  staging mapping — previously a concurrent read of the same buffer
+  could rewrite the mapping mid-copy.
+
 ### Fixed — review round 1 (2026-10-09)
 
 - **P1 (soundness):** `VulkanDevice: Send + Sync` made the unsynchronized
@@ -25,6 +34,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `Queue` and `VulkanDevice` are `Send + Sync`, with the soundness
+  contract documented on the type: safe sharing is backed by the
+  `with_compute_queue` submission protocol (see below), not an appeal
+  to caller discipline.
 - `VulkanDevice` now overrides `create_device_buffer` /
   `create_device_buffer_uninit` to **force device-local + staging
   allocation regardless of the negotiated strategy** — a consumer that
