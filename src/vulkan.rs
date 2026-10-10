@@ -468,52 +468,90 @@ unsafe fn allocate_device_local_buffer(
 /// # Safety
 ///
 /// Vulkan FFI.
+/// One-shot transfer. The error's `bool` is **"submission reached the
+/// GPU"**: `false` means nothing was submitted (allocate/begin/end/submit
+/// failed — the recorded resources are untouched and safe to reclaim);
+/// `true` means submission succeeded but the wait failed — the GPU's
+/// access to the recorded resources is **indeterminate** (the spec
+/// permits e.g. host-OOM from the wait; it is neither proof of device
+/// loss nor of completion), so reclaiming them would be a driver-level
+/// use-after-free. The sound side is to leak (review r2 P1).
 unsafe fn one_shot_transfer(
     device: &ash::Device,
     command_pool: vk::CommandPool,
     queue: vk::Queue,
     record: impl FnOnce(vk::CommandBuffer),
-) -> Result<()> {
+) -> std::result::Result<(), (DeviceError, bool)> {
     unsafe {
         let alloc_info = vk::CommandBufferAllocateInfo::default()
             .command_pool(command_pool)
             .level(vk::CommandBufferLevel::PRIMARY)
             .command_buffer_count(1);
-        let cmd = device.allocate_command_buffers(&alloc_info).map_err(|e| {
-            DeviceError::BufferCreationFailed {
-                message: format!("transfer allocate: {e}"),
+        let cmd = match device.allocate_command_buffers(&alloc_info) {
+            Ok(cmds) => cmds[0],
+            Err(e) => {
+                return Err((
+                    DeviceError::BufferCreationFailed {
+                        message: format!("transfer allocate: {e}"),
+                    },
+                    false,
+                ));
             }
-        })?[0];
+        };
 
         let begin_info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        device.begin_command_buffer(cmd, &begin_info).map_err(|e| {
-            DeviceError::BufferCreationFailed {
-                message: format!("transfer begin: {e}"),
-            }
-        })?;
+        if let Err(e) = device.begin_command_buffer(cmd, &begin_info) {
+            // Never submitted: the command buffer is not pending and may
+            // be freed (closes the r1 P3 cb-retention follow-up for the
+            // pre-submit failure paths).
+            device.free_command_buffers(command_pool, &[cmd]);
+            return Err((
+                DeviceError::BufferCreationFailed {
+                    message: format!("transfer begin: {e}"),
+                },
+                false,
+            ));
+        }
 
         record(cmd);
 
-        device
-            .end_command_buffer(cmd)
-            .map_err(|e| DeviceError::BufferCreationFailed {
-                message: format!("transfer end: {e}"),
-            })?;
+        if let Err(e) = device.end_command_buffer(cmd) {
+            device.free_command_buffers(command_pool, &[cmd]);
+            return Err((
+                DeviceError::BufferCreationFailed {
+                    message: format!("transfer end: {e}"),
+                },
+                false,
+            ));
+        }
 
         let submit_info = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
-        device
-            .queue_submit(queue, std::slice::from_ref(&submit_info), vk::Fence::null())
-            .map_err(|e| DeviceError::BufferCreationFailed {
-                message: format!("transfer submit: {e}"),
-            })?;
-        device
-            .queue_wait_idle(queue)
-            .map_err(|e| DeviceError::BufferCreationFailed {
-                message: format!("transfer wait: {e}"),
-            })?;
+        if let Err(e) =
+            device.queue_submit(queue, std::slice::from_ref(&submit_info), vk::Fence::null())
+        {
+            device.free_command_buffers(command_pool, &[cmd]);
+            return Err((
+                DeviceError::BufferCreationFailed {
+                    message: format!("transfer submit: {e}"),
+                },
+                false,
+            ));
+        }
 
-        device.free_command_buffers(command_pool, std::slice::from_ref(&cmd));
+        // From here the command buffer is pending: it must NOT be freed
+        // on the failure path below — only the pool's destruction (or a
+        // later successful wait) can release it.
+        if let Err(e) = device.queue_wait_idle(queue) {
+            return Err((
+                DeviceError::BufferCreationFailed {
+                    message: format!("transfer wait: {e}"),
+                },
+                true,
+            ));
+        }
+
+        device.free_command_buffers(command_pool, &[cmd]);
         Ok(())
     }
 }
@@ -855,10 +893,13 @@ impl VulkanDevice {
             if let Some(src) = data {
                 if byte_len > 0 {
                     unsafe { ptr::copy_nonoverlapping(src, stg_mapped, byte_len as usize) };
-                    // Same failure discipline: free BOTH allocations if the
-                    // upload transfer fails, then propagate the original
-                    // transfer error (review r1: don't discard the detail).
-                    if let Err(e) = self.with_compute_queue(|queue| unsafe {
+                    // Failure discipline: reclaim BOTH allocations only
+                    // when nothing reached the GPU (review r1: propagate
+                    // the original error; review r2 P1: a failed wait
+                    // after a successful submit leaves the GPU's access
+                    // indeterminate — destroying would be a driver-level
+                    // use-after-free, so that case deliberately leaks).
+                    if let Err((e, submitted)) = self.with_compute_queue(|queue| unsafe {
                         one_shot_transfer(&self.device, self.command_pool, queue, |cmd| {
                             let copy = vk::BufferCopy::default().size(aligned);
                             self.device.cmd_copy_buffer(
@@ -869,11 +910,13 @@ impl VulkanDevice {
                             );
                         })
                     }) {
-                        unsafe {
-                            self.device.destroy_buffer(stg_buf, None);
-                            self.device.free_memory(stg_mem, None);
-                            self.device.destroy_buffer(dev_buf, None);
-                            self.device.free_memory(dev_mem, None);
+                        if !submitted {
+                            unsafe {
+                                self.device.destroy_buffer(stg_buf, None);
+                                self.device.free_memory(stg_mem, None);
+                                self.device.destroy_buffer(dev_buf, None);
+                                self.device.free_memory(dev_mem, None);
+                            }
                         }
                         return Err(e);
                     }
@@ -1089,7 +1132,8 @@ impl Device for VulkanDevice {
                         stg_buf,
                         std::slice::from_ref(&copy),
                     );
-                })?;
+                })
+                .map_err(|(e, _)| e)?;
             }
             let src = inner.mapped as *const T;
             let slice = std::slice::from_raw_parts(src, count);

@@ -15,16 +15,20 @@ step now frees what was created before it propagates:
 
 - `buffer_new` (device-local branch): staging-allocation failure frees
   the device buffer+memory; upload-transfer failure frees both
-  allocations and propagates the original transfer error (r1: the
-  detail was initially discarded).
+  allocations **only when nothing reached the GPU** and propagates the
+  original transfer error (r1: the detail was initially discarded).
+  After a successful submit with a failed wait, the GPU's access to the
+  buffers is indeterminate — that case now deliberately leaks rather
+  than destroy in-flight resources (r2 P1).
 - `allocate_buffer`: memory-type lookup, `vkAllocateMemory`,
   `vkBindBufferMemory`, and `vkMapMemory` failures destroy the buffer
   (and free the memory once allocated).
 - `allocate_device_local_buffer`: same for memory-type lookup,
   `vkAllocateMemory`, and `vkBindBufferMemory`.
 
-Known follow-up (review r1, P3 — not this patch): `one_shot_transfer`
-retains its command buffer on begin/submit failure paths (pre-existing).
+Closed in this patch (was r1 P3): `one_shot_transfer` frees its
+command buffer on every pre-submit failure path and documents why the
+pending command buffer must NOT be freed after a failed wait.
 
 Runtime fault injection is not feasible in a unit test (ash exposes no
 mock layer and a test-only allocator seam is out of patch scope); the
