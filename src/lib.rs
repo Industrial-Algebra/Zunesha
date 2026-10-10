@@ -67,6 +67,9 @@ pub mod vulkan;
 /// strictly stronger than per-library tracking.
 pub mod epoch;
 
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub mod metal;
+
 pub use epoch::GpuEpochTracker;
 pub use error::{DeviceError, Result};
 
