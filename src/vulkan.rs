@@ -1031,7 +1031,7 @@ impl Device for VulkanDevice {
         // rewrite the mapping mid-copy (review round 2, P1). Unified buffers
         // (no staging) read their own mapping directly — no transfer, no
         // staging race — and still take the lock for uniformity.
-        Ok(self.with_compute_queue(|queue| unsafe {
+        self.with_compute_queue(|queue| unsafe {
             if let Some(stg_buf) = inner.staging_buffer {
                 one_shot_transfer(&self.device, self.command_pool, queue, |cmd| {
                     let copy = vk::BufferCopy::default().size(inner.size);
@@ -1045,8 +1045,8 @@ impl Device for VulkanDevice {
             }
             let src = inner.mapped as *const T;
             let slice = std::slice::from_raw_parts(src, count);
-            slice.to_vec()
-        })?)
+            Ok(slice.to_vec())
+        })
     }
 
     fn in_flight(&self) -> u64 {
