@@ -24,7 +24,7 @@ step now frees what was created before it propagates:
   now honors: buffer drop and device teardown quiesce best-effort first
   (`quiesce_for_teardown` / inline `device_wait_idle`) and LEAK —
   with a stderr note — rather than destroy, if the device will not
-  quiesce (sound for persistent host-OEM and device loss alike).
+  quiesce (sound for persistent host-OOM and device loss alike).
 - `allocate_buffer`: memory-type lookup, `vkAllocateMemory`,
   `vkBindBufferMemory`, and `vkMapMemory` failures destroy the buffer
   (and free the memory once allocated).
