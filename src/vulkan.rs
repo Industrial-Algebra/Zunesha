@@ -599,6 +599,13 @@ pub struct VulkanDevice {
     compute_queue: vk::Queue,
     /// Transient command pool (on the compute family) for one-shot transfers.
     command_pool: vk::CommandPool,
+    /// Serializes every submission to the shared compute queue and every
+    /// use of `command_pool` — both are *externally synchronized* Vulkan
+    /// objects (one host thread at a time, spec §7). The substrate's own
+    /// staging transfers and consumer submissions
+    /// ([`with_compute_queue`](VulkanDevice::with_compute_queue)) take this
+    /// lock, which is what makes `Send + Sync` sound (review round 1, P1).
+    submit_lock: std::sync::Mutex<()>,
     memory_properties: vk::PhysicalDeviceMemoryProperties,
     memory_strategy: MemoryStrategy,
     /// Effective memory placement: device-local (VRAM) vs host-visible.
@@ -609,17 +616,46 @@ pub struct VulkanDevice {
 
 impl Drop for VulkanDevice {
     fn drop(&mut self) {
+        // Defensive idle is GATED on the epoch tracker, not blanket:
+        // Zunesha's own one-shot transfers retire synchronously, and the
+        // consumer contract is that all submissions are retired before the
+        // last handle drops (Borsalino pulses wait their fence *before*
+        // releasing their `Arc`). A blanket `device_wait_idle` on every
+        // last-release teardown stampedes driver-internal locks under
+        // parallel test load — the failure mode Borsalino removed from its
+        // own teardown and review round 1 flagged as regressed here. When
+        // consumer dispatch accounting is wired into the tracker (ADR 0003
+        // end state), this backstop fires exactly when work is outstanding.
+        if self.epoch.in_flight() > 0 {
+            unsafe {
+                self.device.device_wait_idle().ok();
+            }
+        }
         // Safety: command pool before device before instance (Vulkan order).
         // Buffers must already have been dropped by the caller (documented
         // invariant) — they hold a cloned device handle.
         unsafe {
-            self.device.device_wait_idle().ok();
             self.device.destroy_command_pool(self.command_pool, None);
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
         }
     }
 }
+
+// Compile-time proof that the device is shareable behind an `Arc` across
+// threads — Borsalino's consumer contract (its buffers/pulses may outlive
+// the backend and are moved between threads). Sound because: every field is
+// either an ash handle (Send+Sync by ash's own impls), the loader `Entry`
+// (fn tables + `Arc<Library>`), or the atomic epoch tracker; and every
+// mutation of the externally-synchronized shared objects (the compute queue
+// and the transfer command pool) is serialized through `submit_lock` —
+// internally by the staging paths, and by consumers via
+// `with_compute_queue` (review round 1, P1: without that protocol, safe
+// code could race `vkQueueSubmit`/command-pool use from cloned `Arc`s).
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<VulkanDevice>();
+};
 
 impl VulkanDevice {
     /// Build a device from a full [`InitRequest`].
@@ -726,6 +762,7 @@ impl VulkanDevice {
             uses_device_local,
             limits,
             epoch: GpuEpochTracker::new(),
+            submit_lock: std::sync::Mutex::new(()),
         })
     }
 
@@ -736,6 +773,91 @@ impl VulkanDevice {
             | vk::BufferUsageFlags::VERTEX_BUFFER
             | vk::BufferUsageFlags::TRANSFER_SRC
             | vk::BufferUsageFlags::TRANSFER_DST
+    }
+
+    /// Shared buffer allocation path.
+    ///
+    /// `data` uploads `byte_len` bytes when present (`None` = uninitialised).
+    /// `force_device_local` takes the device-local + staging path even when
+    /// the negotiated strategy is host-visible — the
+    /// [`Device::create_device_buffer`](crate::Device::create_device_buffer)
+    /// contract: GPU-resident data under a forced-`Unified` device. Found by
+    /// the Borsalino migration survey — note Borsalino's own override
+    /// diverges from its trait docs the *other* way (host-visible under
+    /// forced `Unified`); this implements the documented contract, not
+    /// Borsalino's behavior.
+    fn buffer_new(
+        &self,
+        byte_len: vk::DeviceSize,
+        data: Option<*const c_void>,
+        force_device_local: bool,
+    ) -> Result<crate::Buffer> {
+        let aligned = if byte_len == 0 {
+            self.limits.min_storage_buffer_offset_alignment
+        } else {
+            align_up(byte_len, self.limits.min_storage_buffer_offset_alignment)
+        };
+        let usage = Self::buffer_usage();
+
+        let (buffer, memory, mapped, staging_buffer, staging_memory) = if self.uses_device_local
+            || force_device_local
+        {
+            // Device-local buffer + host-visible staging; copy data →
+            // staging, then staging → device.
+            let (dev_buf, dev_mem) = unsafe {
+                allocate_device_local_buffer(&self.device, &self.memory_properties, aligned, usage)?
+            };
+            let (stg_buf, stg_mem, stg_mapped) = unsafe {
+                allocate_buffer(
+                    &self.device,
+                    &self.memory_properties,
+                    aligned,
+                    vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
+                )?
+            };
+            if let Some(src) = data {
+                if byte_len > 0 {
+                    unsafe { ptr::copy_nonoverlapping(src, stg_mapped, byte_len as usize) };
+                    self.with_compute_queue(|queue| unsafe {
+                        one_shot_transfer(&self.device, self.command_pool, queue, |cmd| {
+                            let copy = vk::BufferCopy::default().size(aligned);
+                            self.device.cmd_copy_buffer(
+                                cmd,
+                                stg_buf,
+                                dev_buf,
+                                std::slice::from_ref(&copy),
+                            );
+                        })
+                    })?;
+                }
+            }
+            (dev_buf, dev_mem, stg_mapped, Some(stg_buf), Some(stg_mem))
+        } else {
+            // Unified memory: single host-visible buffer.
+            let (buf, mem, mapped) =
+                unsafe { allocate_buffer(&self.device, &self.memory_properties, aligned, usage)? };
+            if let Some(src) = data {
+                if byte_len > 0 {
+                    unsafe { ptr::copy_nonoverlapping(src, mapped, byte_len as usize) };
+                }
+            }
+            (buf, mem, mapped, None, None)
+        };
+
+        let inner = Box::new(VulkanBufferInner {
+            buffer,
+            memory,
+            size: aligned,
+            mapped,
+            staging_buffer,
+            staging_memory,
+            device: self.device.clone(),
+        });
+        Ok(crate::Buffer {
+            raw: Box::into_raw(inner) as *mut c_void,
+            len: byte_len as usize,
+            drop_fn: drop_vulkan_buffer,
+        })
     }
 
     /// The Vulkan entry (loader handle) this device was created from.
@@ -790,6 +912,32 @@ impl VulkanDevice {
         // `create_buffer` and remains valid while `buffer` is alive.
         unsafe { (*(buffer.raw as *const VulkanBufferInner)).buffer }
     }
+
+    /// Run `f` with the shared compute queue, serialized against every
+    /// other submission (the substrate's own staging transfers and other
+    /// consumers' dispatch work).
+    ///
+    /// Vulkan queues and command pools are *externally synchronized*
+    /// objects — at most one host thread may touch a given queue/pool at a
+    /// time (spec host-sync rules). Since [`VulkanDevice`] is `Send + Sync`
+    /// and shareable behind an `Arc`, every submitter must join this
+    /// protocol: **consumers that submit work on the compute queue must do
+    /// so inside this accessor** (submit AND any immediate wait —
+    /// `queue_wait_idle` counts as queue access). Fence-based waits after
+    /// the submit returns do not touch the queue and need no lock.
+    ///
+    /// The lock is held only for the closure's duration; it is never held
+    /// across a long-running GPU wait started elsewhere.
+    pub fn with_compute_queue<R>(&self, f: impl FnOnce(vk::Queue) -> R) -> R {
+        // Poisoning only means a submitter panicked mid-closure; the queue
+        // state is still usable (Vulkan object state is not corrupted by a
+        // host panic between calls), so steal the lock and continue.
+        let _guard = self
+            .submit_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        f(self.compute_queue)
+    }
 }
 
 impl Device for VulkanDevice {
@@ -830,150 +978,39 @@ impl Device for VulkanDevice {
     }
 
     fn create_buffer<T: bytemuck::Pod>(&self, data: &[T]) -> Result<crate::Buffer> {
-        let byte_len = mem::size_of_val(data) as vk::DeviceSize;
-        let aligned = if byte_len == 0 {
-            self.limits.min_storage_buffer_offset_alignment
-        } else {
-            align_up(byte_len, self.limits.min_storage_buffer_offset_alignment)
-        };
-        let usage = Self::buffer_usage();
-
-        let (buffer, memory, mapped, staging_buffer, staging_memory) = if self.uses_device_local {
-            // Device-local buffer + host-visible staging; copy data → staging,
-            // then staging → device.
-            let (dev_buf, dev_mem) = unsafe {
-                allocate_device_local_buffer(&self.device, &self.memory_properties, aligned, usage)?
-            };
-            let (stg_buf, stg_mem, stg_mapped) = unsafe {
-                allocate_buffer(
-                    &self.device,
-                    &self.memory_properties,
-                    aligned,
-                    vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
-                )?
-            };
-            if byte_len > 0 {
-                unsafe {
-                    ptr::copy_nonoverlapping(
-                        data.as_ptr() as *const c_void,
-                        stg_mapped,
-                        byte_len as usize,
-                    );
-                }
-                unsafe {
-                    one_shot_transfer(
-                        &self.device,
-                        self.command_pool,
-                        self.compute_queue,
-                        |cmd| {
-                            let copy = vk::BufferCopy::default().size(aligned);
-                            self.device.cmd_copy_buffer(
-                                cmd,
-                                stg_buf,
-                                dev_buf,
-                                std::slice::from_ref(&copy),
-                            );
-                        },
-                    )?;
-                }
-            }
-            (dev_buf, dev_mem, stg_mapped, Some(stg_buf), Some(stg_mem))
-        } else {
-            // Unified memory: single host-visible buffer.
-            let (buf, mem, mapped) =
-                unsafe { allocate_buffer(&self.device, &self.memory_properties, aligned, usage)? };
-            if byte_len > 0 {
-                unsafe {
-                    ptr::copy_nonoverlapping(
-                        data.as_ptr() as *const c_void,
-                        mapped,
-                        byte_len as usize,
-                    );
-                }
-            }
-            (buf, mem, mapped, None, None)
-        };
-
-        let inner = Box::new(VulkanBufferInner {
-            buffer,
-            memory,
-            size: aligned,
-            mapped,
-            staging_buffer,
-            staging_memory,
-            device: self.device.clone(),
-        });
-        Ok(crate::Buffer {
-            raw: Box::into_raw(inner) as *mut c_void,
-            len: byte_len as usize,
-            drop_fn: drop_vulkan_buffer,
-        })
+        self.buffer_new(
+            mem::size_of_val(data) as vk::DeviceSize,
+            Some(data.as_ptr() as *const c_void),
+            false,
+        )
     }
 
     fn create_buffer_uninit<T: bytemuck::Pod>(&self, len: usize) -> Result<crate::Buffer> {
-        let byte_len = (len * mem::size_of::<T>()) as vk::DeviceSize;
-        let aligned = if byte_len == 0 {
-            self.limits.min_storage_buffer_offset_alignment
-        } else {
-            align_up(byte_len, self.limits.min_storage_buffer_offset_alignment)
-        };
-        let usage = Self::buffer_usage();
+        self.buffer_new((len * mem::size_of::<T>()) as vk::DeviceSize, None, false)
+    }
 
-        let (buffer, memory, mapped, staging_buffer, staging_memory) = if self.uses_device_local {
-            let (dev_buf, dev_mem) = unsafe {
-                allocate_device_local_buffer(&self.device, &self.memory_properties, aligned, usage)?
-            };
-            let (stg_buf, stg_mem, stg_mapped) = unsafe {
-                allocate_buffer(
-                    &self.device,
-                    &self.memory_properties,
-                    aligned,
-                    vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
-                )?
-            };
-            (dev_buf, dev_mem, stg_mapped, Some(stg_buf), Some(stg_mem))
-        } else {
-            let (buf, mem, mapped) =
-                unsafe { allocate_buffer(&self.device, &self.memory_properties, aligned, usage)? };
-            (buf, mem, mapped, None, None)
-        };
+    /// Forces the device-local + staging path regardless of the negotiated
+    /// strategy (Borsalino's GPU-resident-weights contract; see the shared
+    /// `buffer_new` allocation path). On hardware with no distinct
+    /// device-local heap the `DEVICE_LOCAL`-flagged memory type is used
+    /// wherever the driver exposes one.
+    fn create_device_buffer<T: bytemuck::Pod>(&self, data: &[T]) -> Result<crate::Buffer> {
+        self.buffer_new(
+            mem::size_of_val(data) as vk::DeviceSize,
+            Some(data.as_ptr() as *const c_void),
+            true,
+        )
+    }
 
-        let inner = Box::new(VulkanBufferInner {
-            buffer,
-            memory,
-            size: aligned,
-            mapped,
-            staging_buffer,
-            staging_memory,
-            device: self.device.clone(),
-        });
-        Ok(crate::Buffer {
-            raw: Box::into_raw(inner) as *mut c_void,
-            len: byte_len as usize,
-            drop_fn: drop_vulkan_buffer,
-        })
+    /// Uninitialised variant of [`create_device_buffer`](Self::create_device_buffer).
+    fn create_device_buffer_uninit<T: bytemuck::Pod>(&self, len: usize) -> Result<crate::Buffer> {
+        self.buffer_new((len * mem::size_of::<T>()) as vk::DeviceSize, None, true)
     }
 
     fn read_buffer<T: bytemuck::Pod>(&self, buffer: &crate::Buffer) -> Result<Vec<T>> {
         // Safety: `raw` was produced by `Box::into_raw::<VulkanBufferInner>` and
         // is still valid (buffer not dropped).
         let inner = unsafe { &*(buffer.raw as *const VulkanBufferInner) };
-
-        // Device-local buffers: copy device → staging, then read the staging
-        // mapping. Unified buffers: read the buffer's own mapping directly.
-        if let Some(stg_buf) = inner.staging_buffer {
-            unsafe {
-                one_shot_transfer(&self.device, self.command_pool, self.compute_queue, |cmd| {
-                    let copy = vk::BufferCopy::default().size(inner.size);
-                    self.device.cmd_copy_buffer(
-                        cmd,
-                        inner.buffer,
-                        stg_buf,
-                        std::slice::from_ref(&copy),
-                    );
-                })?;
-            }
-        }
 
         if inner.mapped.is_null() {
             return Err(DeviceError::BufferReadFailed {
@@ -986,9 +1023,30 @@ impl Device for VulkanDevice {
         } else {
             buffer.len / mem::size_of::<T>()
         };
-        let src = inner.mapped as *const T;
-        let slice = unsafe { std::slice::from_raw_parts(src, count) };
-        Ok(slice.to_vec())
+
+        // Device-local buffers: copy device → staging, then read the staging
+        // mapping — BOTH under the submission lock. The staging mapping is
+        // shared per-buffer: releasing the lock between the transfer and the
+        // host copy would let a concurrent `read_buffer` of the same buffer
+        // rewrite the mapping mid-copy (review round 2, P1). Unified buffers
+        // (no staging) read their own mapping directly — no transfer, no
+        // staging race — and still take the lock for uniformity.
+        self.with_compute_queue(|queue| unsafe {
+            if let Some(stg_buf) = inner.staging_buffer {
+                one_shot_transfer(&self.device, self.command_pool, queue, |cmd| {
+                    let copy = vk::BufferCopy::default().size(inner.size);
+                    self.device.cmd_copy_buffer(
+                        cmd,
+                        inner.buffer,
+                        stg_buf,
+                        std::slice::from_ref(&copy),
+                    );
+                })?;
+            }
+            let src = inner.mapped as *const T;
+            let slice = std::slice::from_raw_parts(src, count);
+            Ok(slice.to_vec())
+        })
     }
 
     fn in_flight(&self) -> u64 {
@@ -1234,5 +1292,98 @@ mod tests {
                 "no graphics on this host (compute-only) — preference honoured, no requirement"
             );
         }
+    }
+
+    /// Safe code can share one `Arc<VulkanDevice>` across threads; the
+    /// staging transfers those threads trigger must therefore be
+    /// internally serialized (the `submit_lock` protocol — review round
+    /// 1's P1, with the readback copy inside the lock per round 2's).
+    /// Regression: concurrent device-local buffer creation + readback from
+    /// four threads round-trips exactly and does not deadlock.
+    #[test]
+    #[serial]
+    fn concurrent_buffer_creation_is_serialized() {
+        let device = std::sync::Arc::new(match VulkanDevice::init() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Vulkan device ({e})");
+                return;
+            }
+        });
+        let mut handles = Vec::new();
+        for t in 0..4u32 {
+            let device = std::sync::Arc::clone(&device);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..8u32 {
+                    let payload = [(t * 8 + i) as f32; 4];
+                    let buf = device.create_device_buffer(&payload).unwrap();
+                    let back: Vec<f32> = device.read_buffer(&buf).unwrap();
+                    assert_eq!(back, payload);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("no thread panicked under the submit lock");
+        }
+    }
+
+    /// `create_device_buffer` must allocate device-local even when the
+    /// device strategy is forced `Unified` — the documented trait contract
+    /// for GPU-resident data (Borsalino's own implementation takes the
+    /// host-visible path there instead, diverging from its trait docs;
+    /// see the Borsalino migration plan §5.1 for the full relationship).
+    ///
+    /// Observable via internals: a device-local allocation carries a staging
+    /// buffer; the strategy-respecting `create_buffer` under `Unified` does
+    /// not. Both must still upload and read back exactly.
+    #[test]
+    #[serial]
+    fn device_buffer_forces_device_local_under_unified_strategy() {
+        let device = match VulkanDevice::init_with_strategy(MemoryStrategy::Unified) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Vulkan device ({e})");
+                return;
+            }
+        };
+
+        // The forced path needs a real device-local heap: only meaningful
+        // on discrete GPUs (the RTX 5080 seat). Integrated/CPU devices have
+        // no distinct local heap to force.
+        let props = unsafe {
+            device
+                .instance
+                .get_physical_device_properties(device.physical_device)
+        };
+        if props.device_type != vk::PhysicalDeviceType::DISCRETE_GPU {
+            eprintln!(
+                "skipping: {} is not discrete — no device-local heap to force",
+                unsafe { CStr::from_ptr(props.device_name.as_ptr()) }.to_string_lossy()
+            );
+            return;
+        }
+
+        let unified = device.create_buffer(&[1.0f32, 2.0, 3.0, 4.0]).unwrap();
+        let forced = device
+            .create_device_buffer(&[1.0f32, 2.0, 3.0, 4.0])
+            .unwrap();
+
+        // Safety: both handles were produced by this device's create paths.
+        let u = unsafe { &*(unified.raw as *const VulkanBufferInner) };
+        let f = unsafe { &*(forced.raw as *const VulkanBufferInner) };
+        assert!(
+            u.staging_buffer.is_none(),
+            "Unified-strategy create_buffer must stay host-visible"
+        );
+        assert!(
+            f.staging_buffer.is_some(),
+            "create_device_buffer must force the device-local + staging path"
+        );
+
+        // Both placements upload and read back exactly.
+        let r1: Vec<f32> = device.read_buffer(&unified).unwrap();
+        let r2: Vec<f32> = device.read_buffer(&forced).unwrap();
+        assert_eq!(r1, vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(r2, vec![1.0, 2.0, 3.0, 4.0]);
     }
 }
