@@ -14,7 +14,7 @@ default = []
 # v0.1 ships the `Device` trait, the opaque-handle surface, the ported epoch
 # tracker, a NoDevice stub, and the complete Vulkan backend. Metal lands
 # post-v0.1 (substrate-first: Zunesha-Metal precedes Goldenweek-Metal).
-metal = []
+metal = ["dep:objc"]
 vulkan = ["dep:ash"]
 # karpal-verify obligation bundles for device/buffer-lifecycle properties
 # (buffer alignment, quiescence). Lands alongside the verification seam.
@@ -29,7 +29,10 @@ bytemuck = { version = "1", features = ["derive"] }
 # device + queues + memory + buffer layer.
 #
 # Backend dependencies are reintroduced alongside src/metal.rs / src/vulkan.rs.
-# Vulkan is live from this release; Metal still pending.
+# Both live: Vulkan (Linux/Windows) since v0.1, Metal (macOS) on this branch.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc = { version = "0.2", optional = true } # raw objc_msgSend FFI (Metal backend)
+
 [target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
 ash = { version = "0.38", optional = true }
 
@@ -50,5 +53,12 @@ required-features = ["vulkan"]
 # (quiescence runs on default features — pure CPU, CI-safe)
 
 # Still pending:
-#   metal  (macOS)         -> objc = "0.2"            (raw objc_msgSend FFI)
 # verify will add: karpal-verify, karpal-proof (optional).
+
+[[example]]
+name = "device-info-metal"
+required-features = ["metal"]
+
+[[example]]
+name = "buffer-roundtrip-metal"
+required-features = ["metal"]
