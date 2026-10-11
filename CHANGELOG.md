@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] — 2026-10-10
+
 ### Fixed — allocation-failure cleanup (2026-10-10)
 
 Found by the Borsalino Phase-2 review (PR #60 round 1): the buffer
