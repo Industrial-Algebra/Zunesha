@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — dispatch-scope guard (ADR 0005 Phase 1)
+
+- **`Device::with_dispatch`** — the consumer dispatch-scope guard: run a
+  submission (and its settle) inside the scope and `in_flight()` /
+  `is_quiescent()` / `prove_quiescent()` account for it on both backends.
+  Implemented on the `GpuEpochTracker`'s new panic-safe `scope`; nesting
+  counts depth; unwind retires the epoch.
+- **`with_compute_queue` (Vulkan) is now a tracked scope** — entering the
+  raw-queue hatch begins an epoch, exit retires it; consumers do not
+  nest it inside `with_dispatch`.
+- On Vulkan the scope joins the `SubmissionProtocol` (a quiesce cannot
+  interleave between epoch-begin and submit); on Metal it is pure epoch
+  accounting (documented thread-safe queue, ADR 0004 §4).
+- ADR 0005 records Borsalino's teardown constraint as normative —
+  epoch-gated quiesce, never blanket `device_wait_idle` — and designs
+  cross-queue ownership transfer (per-buffer ledger + release/acquire
+  barriers) as Phase 2: **designed, not landed**, per ADR 0001's
+  reversibility clause.
+- **Breaking (0.x):** `with_dispatch` is a required `Device` trait
+  method; `NoDeviceStub` implements it as the identity. No external
+  implementors exist today.
+
 ## [0.1.2] — 2026-10-10
 
 ### Fixed — allocation-failure cleanup (2026-10-10)

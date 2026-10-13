@@ -135,6 +135,29 @@ impl GpuEpochTracker {
             None
         }
     }
+
+    /// Run `f` as one tracked dispatch epoch (ADR 0005 §2).
+    ///
+    /// Begins a dispatch on entry and ends it on scope exit — normal
+    /// return **or panic unwind** (a private `Drop` guard retires the
+    /// epoch; a panicking consumer cannot stick an in-flight count).
+    /// Backends' [`with_dispatch`](crate::Device::with_dispatch) is built
+    /// on this; nesting counts depth, as the counter is a depth not a
+    /// boolean.
+    pub fn scope<R>(&self, f: impl FnOnce() -> R) -> R {
+        self.begin_dispatch();
+        let _end = EndOnDrop(self);
+        f()
+    }
+}
+
+/// Retires one epoch on drop — including during panic unwind.
+struct EndOnDrop<'a>(&'a GpuEpochTracker);
+
+impl Drop for EndOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.end_dispatch();
+    }
 }
 
 #[cfg(test)]
@@ -146,6 +169,28 @@ mod tests {
         let tracker = GpuEpochTracker::new();
         assert_eq!(tracker.in_flight(), 0);
         assert!(tracker.is_quiescent());
+    }
+
+    /// ADR 0005 §2: the scope retires its epoch on unwind — a panicking
+    /// consumer cannot stick an in-flight count (the `Drop` guard is the
+    /// whole point of `scope` over manual begin/end).
+    #[test]
+    fn scope_panic_retires_the_epoch() {
+        let tracker = GpuEpochTracker::new();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tracker.scope(|| panic!("consumer panicked inside the scope"));
+        }));
+        assert!(r.is_err());
+        assert_eq!(tracker.in_flight(), 0, "unwind must retire the epoch");
+    }
+
+    /// ADR 0005 §2: nesting counts depth, not a boolean.
+    #[test]
+    fn scope_nesting_counts_depth() {
+        let tracker = GpuEpochTracker::new();
+        let inner = tracker.scope(|| tracker.scope(|| tracker.in_flight()));
+        assert_eq!(inner, 2);
+        assert_eq!(tracker.in_flight(), 0);
     }
 
     #[test]

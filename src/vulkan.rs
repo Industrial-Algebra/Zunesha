@@ -1221,8 +1221,10 @@ impl VulkanDevice {
         // Per-protocol reentrancy + cross-thread exclusion live in
         // [`TransferProtocol::enter`] (reviews r5+r6 P1s: same-device
         // nested entry must not deadlock; another device's lock must
-        // still be acquired).
-        self.protocol.enter(|| f(self.compute_queue))
+        // still be acquired). ADR 0005 §2: the hatch is itself a tracked
+        // scope — entering begins an epoch, exit (or unwind) retires it.
+        self.protocol
+            .enter(|| self.epoch.scope(|| f(self.compute_queue)))
     }
 }
 
@@ -1342,6 +1344,13 @@ impl Device for VulkanDevice {
 
     fn is_quiescent(&self) -> bool {
         self.epoch.is_quiescent()
+    }
+
+    /// ADR 0005 §2: the scope joins the submission protocol, so a quiesce
+    /// cannot interleave between a consumer's epoch-begin and its submit.
+    /// The raw `with_compute_queue` hatch is itself a tracked scope.
+    fn with_dispatch<R>(&self, f: impl FnOnce() -> R) -> R {
+        self.protocol.enter(|| self.epoch.scope(f))
     }
 }
 
@@ -1767,5 +1776,95 @@ mod tests {
         let r2: Vec<f32> = device.read_buffer(&forced).unwrap();
         assert_eq!(r1, vec![1.0, 2.0, 3.0, 4.0]);
         assert_eq!(r2, vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    // ── ADR 0005: dispatch-scope guard ────────────────────────────
+
+    /// A `with_dispatch` scope counts exactly one in-flight epoch while
+    /// running and none after (ADR 0005 §2).
+    #[test]
+    fn with_dispatch_counts_one_epoch() {
+        let device = match VulkanDevice::init() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Vulkan device ({e})");
+                return;
+            }
+        };
+        assert_eq!(device.in_flight(), 0, "precondition: quiescent");
+        let seen = device.with_dispatch(|| device.in_flight());
+        assert_eq!(seen, 1, "inside the scope exactly one epoch is in flight");
+        assert_eq!(device.in_flight(), 0, "scope exit retires the epoch");
+    }
+
+    /// Nested scopes are legal and count depth — the tracker is a
+    /// counter, not a boolean (ADR 0005 §2, reentrancy).
+    #[test]
+    fn nested_dispatch_scopes_count_depth() {
+        let device = match VulkanDevice::init() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Vulkan device ({e})");
+                return;
+            }
+        };
+        let seen = device.with_dispatch(|| {
+            assert_eq!(device.in_flight(), 1);
+            device.with_dispatch(|| device.in_flight())
+        });
+        assert_eq!(seen, 2, "inner scope sees two in-flight epochs");
+        assert_eq!(device.in_flight(), 0);
+    }
+
+    /// A panicking consumer cannot stick an epoch: the guard ends the
+    /// dispatch on unwind (ADR 0005 §2).
+    #[test]
+    fn panicking_dispatch_scope_cannot_stick_an_epoch() {
+        let device = match VulkanDevice::init() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Vulkan device ({e})");
+                return;
+            }
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            device.with_dispatch(|| panic!("consumer dispatch panicked"));
+        }));
+        assert!(result.is_err(), "test must observe the panic itself");
+        assert_eq!(device.in_flight(), 0, "unwind must retire the epoch");
+    }
+
+    /// Quiescence proof is gated by live epochs: `None` inside a scope,
+    /// `Some` outside (ADR 0005 §2).
+    #[test]
+    fn prove_quiescent_gated_by_dispatch_scope() {
+        let device = match VulkanDevice::init() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Vulkan device ({e})");
+                return;
+            }
+        };
+        let seen = device.with_dispatch(|| device.prove_quiescent());
+        assert!(seen.is_none(), "inside a scope the device is not quiescent");
+        assert!(device.prove_quiescent().is_some());
+    }
+
+    /// The raw-queue escape hatch is itself a tracked scope: entering
+    /// `with_compute_queue` begins an epoch, exit retires it (ADR 0005
+    /// §2 — consumers do not nest the two).
+    #[test]
+    fn with_compute_queue_is_a_tracked_scope() {
+        let device = match VulkanDevice::init() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Vulkan device ({e})");
+                return;
+            }
+        };
+        assert_eq!(device.in_flight(), 0);
+        let seen = device.with_compute_queue(|_q| device.in_flight());
+        assert_eq!(seen, 1, "raw queue access counts one epoch while held");
+        assert_eq!(device.in_flight(), 0);
     }
 }

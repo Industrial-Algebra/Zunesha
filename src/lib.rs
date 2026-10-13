@@ -34,7 +34,9 @@
 //! - **Unified GC safety.** The epoch tracker (ported from Borsalino) observes
 //!   *every* dispatch through the device — compute and graphics — so a single
 //!   [`Device::is_quiescent`] query certifies no GPU work touches host memory
-//!   before a moving GC compacts.
+//!   before a moving GC compacts. Consumers route dispatches through
+//!   [`Device::with_dispatch`] (ADR 0005); the Vulkan raw-queue hatch is
+//!   itself a tracked scope.
 //! - **Surface-agnostic.** Zunesha does no windowing and compiles no shaders.
 //!
 //! ## Backends
@@ -485,6 +487,25 @@ pub trait Device: Sized {
         0
     }
 
+    /// Run `f` as one tracked dispatch epoch (ADR 0005 §2).
+    ///
+    /// The consumer's dispatch-scope guard: route a submission (and its
+    /// settle — inline wait or observed fence signal) through this scope
+    /// and [`in_flight`](Self::in_flight) / [`is_quiescent`](Self::is_quiescent)
+    /// account for it. On Vulkan the scope joins the same submission
+    /// protocol as [`with_compute_queue`](crate::vulkan::VulkanDevice::with_compute_queue)
+    /// (a raw queue closure **is** a tracked scope); on Metal it is pure
+    /// epoch accounting (the command queue is documented thread-safe).
+    ///
+    /// # Host-synchronous contract
+    ///
+    /// An epoch means "a consumer-acknowledged dispatch window": settle
+    /// before returning. A consumer that returns with GPU work executing
+    /// under-counts in-flight dispatches — the documented limit of
+    /// host-synchronous accounting (ADR 0005 §2). Nesting is legal and
+    /// counts depth; panic unwind retires the epoch.
+    fn with_dispatch<R>(&self, f: impl FnOnce() -> R) -> R;
+
     /// True when no GPU operations are outstanding.
     ///
     /// The runtime (e.g. Baedeker) calls this before GC compaction. Because
@@ -523,6 +544,10 @@ pub struct NoDeviceStub;
 impl Device for NoDeviceStub {
     fn init() -> Result<Self> {
         Err(DeviceError::NoDevice)
+    }
+    fn with_dispatch<R>(&self, f: impl FnOnce() -> R) -> R {
+        // No device, no GPU work: the scope is the identity.
+        f()
     }
     fn queues(&self) -> Queues {
         Queues::stub()

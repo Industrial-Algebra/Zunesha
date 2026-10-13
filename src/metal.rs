@@ -749,6 +749,13 @@ impl Device for MetalDevice {
     fn is_quiescent(&self) -> bool {
         self.epoch.is_quiescent()
     }
+
+    /// ADR 0005 §2: on Metal the scope is pure epoch accounting — the
+    /// `MTLCommandQueue` is documented thread-safe (ADR 0004 §4), so no
+    /// submission protocol is joined.
+    fn with_dispatch<R>(&self, f: impl FnOnce() -> R) -> R {
+        self.epoch.scope(f)
+    }
 }
 
 #[cfg(test)]
@@ -824,16 +831,68 @@ mod tests {
         assert_eq!(device.limits().min_storage_buffer_offset_alignment, 16);
     }
 
-    /// A fresh device is quiescent (epoch counter at zero) — same honest
-    /// tracker state as the Vulkan backend (R6: consumer dispatch
-    /// accounting unwired until ADR-0005-style accounting lands for both
-    /// backends at once).
+    /// A fresh device is quiescent (epoch counter at zero) — and since
+    /// ADR 0005 Phase 1, the counter is real: scopes retire their own
+    /// epochs (see the `with_dispatch` tests below).
     #[test]
     #[serial]
     fn fresh_device_is_quiescent() {
         let Some(device) = test_device() else { return };
         assert_eq!(device.in_flight(), 0);
         assert!(device.is_quiescent());
+        assert!(device.prove_quiescent().is_some());
+    }
+
+    // ── ADR 0005: dispatch-scope guard ────────────────────────────
+
+    /// A `with_dispatch` scope counts exactly one in-flight epoch while
+    /// running and none after (ADR 0005 §2).
+    #[test]
+    #[serial]
+    fn with_dispatch_counts_one_epoch() {
+        let Some(device) = test_device() else { return };
+        assert_eq!(device.in_flight(), 0, "precondition: quiescent");
+        let seen = device.with_dispatch(|| device.in_flight());
+        assert_eq!(seen, 1, "inside the scope exactly one epoch is in flight");
+        assert_eq!(device.in_flight(), 0, "scope exit retires the epoch");
+    }
+
+    /// Nested scopes are legal and count depth — the tracker is a
+    /// counter, not a boolean (ADR 0005 §2, reentrancy).
+    #[test]
+    #[serial]
+    fn nested_dispatch_scopes_count_depth() {
+        let Some(device) = test_device() else { return };
+        let seen = device.with_dispatch(|| {
+            assert_eq!(device.in_flight(), 1);
+            device.with_dispatch(|| device.in_flight())
+        });
+        assert_eq!(seen, 2, "inner scope sees two in-flight epochs");
+        assert_eq!(device.in_flight(), 0);
+    }
+
+    /// A panicking consumer cannot stick an epoch: the guard ends the
+    /// dispatch on unwind (ADR 0005 §2 — structured around the closure,
+    /// not opt-in Drop).
+    #[test]
+    #[serial]
+    fn panicking_dispatch_scope_cannot_stick_an_epoch() {
+        let Some(device) = test_device() else { return };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            device.with_dispatch(|| panic!("consumer dispatch panicked"));
+        }));
+        assert!(result.is_err(), "test must observe the panic itself");
+        assert_eq!(device.in_flight(), 0, "unwind must retire the epoch");
+    }
+
+    /// Quiescence proof is gated by live epochs: `None` inside a scope,
+    /// `Some` outside (ADR 0005 §2 — the proof becomes real observability).
+    #[test]
+    #[serial]
+    fn prove_quiescent_gated_by_dispatch_scope() {
+        let Some(device) = test_device() else { return };
+        let seen = device.with_dispatch(|| device.prove_quiescent());
+        assert!(seen.is_none(), "inside a scope the device is not quiescent");
         assert!(device.prove_quiescent().is_some());
     }
 
