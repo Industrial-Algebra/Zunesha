@@ -1373,22 +1373,52 @@ mod tests {
         eprintln!("skipping: no Vulkan device ({e})");
     }
 
-    /// r2 P1 regression: the gate must (a) hard-fail under
-    /// `ZUNESHA_REQUIRE_VULKAN` and (b) return normally when unset — its
-    /// first cut recursed into itself (a textual replace hit the helper's
-    /// own diagnostic line), which only manifests when an init actually
-    /// fails; green llvmpipe CI never exercised it.
+    /// r2 P1 regression / r3 P1 isolation: both gate modes are exercised
+    /// in SUBPROCESSES. Mutating this process's env — as the first cut did
+    /// with `remove_var` — would (de)arm the gate for every later test in
+    /// the process (r3: under `ZUNESHA_REQUIRE_VULKAN=1` CI, a later init
+    /// failure silently skipped); `#[serial]` cannot contain env state.
+    /// The armed subprocess must panic (non-zero exit), the unset one must
+    /// return cleanly (zero) — the recursion regression (r2) aborts both,
+    /// so it cannot pass this test.
     #[test]
     #[serial]
     fn skip_no_device_gate_is_sound() {
-        // (a) required mode panics.
-        unsafe { std::env::set_var("ZUNESHA_REQUIRE_VULKAN", "1") };
-        let r = std::panic::catch_unwind(|| skip_no_device(DeviceError::NoDevice));
-        unsafe { std::env::remove_var("ZUNESHA_REQUIRE_VULKAN") };
-        assert!(r.is_err(), "require mode must hard-fail on init failure");
+        let exe = std::env::current_exe().expect("test binary path");
+        for (label, armed) in [("armed", true), ("ambient-unset", false)] {
+            let mut cmd = std::process::Command::new(&exe);
+            cmd.args(["skip_no_device_gate_mode_probe", "--test-threads=1"])
+                .env("ZUNESHA_GATE_DRIVER", "1");
+            if armed {
+                cmd.env("ZUNESHA_REQUIRE_VULKAN", "1");
+            } else {
+                // Unset — an empty value would still read as present to
+                // `env::var`, arming the gate.
+                cmd.env_remove("ZUNESHA_REQUIRE_VULKAN");
+            }
+            let out = cmd.output().expect("spawn test binary");
+            let exited = out.status.success();
+            assert_eq!(
+                exited,
+                !armed,
+                "{label}: expected {}",
+                if armed {
+                    "panic / non-zero exit"
+                } else {
+                    "clean zero exit"
+                }
+            );
+        }
+    }
 
-        // (b) unset mode returns normally (regression would abort the test
-        // process via stack overflow — not catchable, correctly fatal).
+    /// Probe driven by [`skip_no_device_gate_is_sound`] via re-exec with a
+    /// tailored environment. Run directly (no `ZUNESHA_GATE_DRIVER`), it is
+    /// a no-op — the ambient environment decides nothing here.
+    #[test]
+    fn skip_no_device_gate_mode_probe() {
+        if std::env::var("ZUNESHA_GATE_DRIVER").is_err() {
+            return;
+        }
         skip_no_device(DeviceError::NoDevice);
     }
 
