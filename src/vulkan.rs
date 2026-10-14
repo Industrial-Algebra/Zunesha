@@ -1365,12 +1365,12 @@ mod tests {
     /// ICD (llvmpipe) and must never pass without touching a real Vulkan
     /// device — the `ZUNESHA_REQUIRE_METAL` pattern, ported (PR #17 r1 P2:
     /// green-with-skips is vacuous coverage).
-    fn skip_no_device(e: &DeviceError) {
+    fn skip_no_device(e: DeviceError) {
         assert!(
             std::env::var("ZUNESHA_REQUIRE_VULKAN").is_err(),
             "ZUNESHA_REQUIRE_VULKAN is set but Vulkan init failed: {e}"
         );
-        skip_no_device(&e);
+        skip_no_device(e);
     }
 
     /// A graphics-requested init selects a device exposing a graphics queue and
@@ -1398,7 +1398,7 @@ mod tests {
         let unified = match VulkanDevice::init_with_strategy(MemoryStrategy::Unified) {
             Ok(d) => d,
             Err(e) => {
-                skip_no_device(&e);
+                skip_no_device(e);
                 return;
             }
         };
@@ -1408,7 +1408,7 @@ mod tests {
         let discrete = match VulkanDevice::init_with_strategy(MemoryStrategy::DeviceLocal) {
             Ok(d) => d,
             Err(e) => {
-                skip_no_device(&e);
+                skip_no_device(e);
                 return;
             }
         };
@@ -1418,7 +1418,7 @@ mod tests {
         let auto = match VulkanDevice::init() {
             Ok(d) => d,
             Err(e) => {
-                skip_no_device(&e);
+                skip_no_device(e);
                 return;
             }
         };
@@ -1438,7 +1438,7 @@ mod tests {
         let device = match VulkanDevice::init_with(pinned(InitRequest::prefer_graphics())) {
             Ok(d) => d,
             Err(e) => {
-                skip_no_device(&e);
+                skip_no_device(e);
                 return;
             }
         };
@@ -1472,7 +1472,7 @@ mod tests {
         let device = match VulkanDevice::init() {
             Ok(d) => d,
             Err(e) => {
-                skip_no_device(&e);
+                skip_no_device(e);
                 return;
             }
         };
@@ -1491,7 +1491,7 @@ mod tests {
         let device = match VulkanDevice::init() {
             Ok(d) => d,
             Err(e) => {
-                skip_no_device(&e);
+                skip_no_device(e);
                 return;
             }
         };
@@ -1530,7 +1530,7 @@ mod tests {
         let device = match VulkanDevice::init_with_strategy(MemoryStrategy::Unified) {
             Ok(d) => d,
             Err(e) => {
-                skip_no_device(&e);
+                skip_no_device(e);
                 return;
             }
         };
@@ -1548,7 +1548,7 @@ mod tests {
         let device = match VulkanDevice::init_with_strategy(MemoryStrategy::DeviceLocal) {
             Ok(d) => d,
             Err(e) => {
-                skip_no_device(&e);
+                skip_no_device(e);
                 return;
             }
         };
@@ -1573,7 +1573,7 @@ mod tests {
         let device = match VulkanDevice::init() {
             Ok(d) => d,
             Err(e) => {
-                skip_no_device(&e);
+                skip_no_device(e);
                 return;
             }
         };
@@ -1590,7 +1590,7 @@ mod tests {
         let device = match VulkanDevice::init_with(pinned(InitRequest::prefer_graphics())) {
             Ok(d) => d,
             Err(e) => {
-                skip_no_device(&e);
+                skip_no_device(e);
                 return;
             }
         };
@@ -1626,7 +1626,7 @@ mod tests {
         let d1 = match VulkanDevice::init() {
             Ok(d) => std::sync::Arc::new(d),
             Err(e) => {
-                skip_no_device(&e);
+                skip_no_device(e);
                 return;
             }
         };
@@ -1686,7 +1686,7 @@ mod tests {
         let device = match VulkanDevice::init() {
             Ok(d) => std::sync::Arc::new(d),
             Err(e) => {
-                skip_no_device(&e);
+                skip_no_device(e);
                 return;
             }
         };
@@ -1710,7 +1710,7 @@ mod tests {
         let device = std::sync::Arc::new(match VulkanDevice::init() {
             Ok(d) => d,
             Err(e) => {
-                skip_no_device(&e);
+                skip_no_device(e);
                 return;
             }
         });
@@ -1746,7 +1746,7 @@ mod tests {
         let device = match VulkanDevice::init_with_strategy(MemoryStrategy::Unified) {
             Ok(d) => d,
             Err(e) => {
-                skip_no_device(&e);
+                skip_no_device(e);
                 return;
             }
         };
@@ -1800,7 +1800,7 @@ mod tests {
         let device = match VulkanDevice::init() {
             Ok(d) => d,
             Err(e) => {
-                skip_no_device(&e);
+                skip_no_device(e);
                 return;
             }
         };
@@ -1817,7 +1817,7 @@ mod tests {
         let device = match VulkanDevice::init() {
             Ok(d) => d,
             Err(e) => {
-                skip_no_device(&e);
+                skip_no_device(e);
                 return;
             }
         };
@@ -1836,7 +1836,7 @@ mod tests {
         let device = match VulkanDevice::init() {
             Ok(d) => d,
             Err(e) => {
-                skip_no_device(&e);
+                skip_no_device(e);
                 return;
             }
         };
@@ -1854,7 +1854,7 @@ mod tests {
         let device = match VulkanDevice::init() {
             Ok(d) => d,
             Err(e) => {
-                skip_no_device(&e);
+                skip_no_device(e);
                 return;
             }
         };
@@ -1871,7 +1871,7 @@ mod tests {
         let device = match VulkanDevice::init() {
             Ok(d) => d,
             Err(e) => {
-                skip_no_device(&e);
+                skip_no_device(e);
                 return;
             }
         };
