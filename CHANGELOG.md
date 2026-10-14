@@ -29,9 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   method; `NoDeviceStub` implements it as the identity. No external
   implementors exist today.
 - **`ZUNESHA_REQUIRE_VULKAN` CI gate** (r1 P2): the Linux vulkan jobs now
-  install an ICD (llvmpipe) and hard-fail Vulkan test skips — previously
-  every Vulkan test silently skipped on ubuntu-latest (no ICD installed),
-  so green never proved execution. Mirrors `ZUNESHA_REQUIRE_METAL`.
+  install an ICD (llvmpipe) and hard-fail on device-init failure —
+  previously every Vulkan test silently skipped on ubuntu-latest (no ICD
+  installed), so green never proved execution. Mirrors
+  `ZUNESHA_REQUIRE_METAL`. Capability-degradation reporting (successful
+  init, missing optional queue) still reports rather than fails; the
+  gate helper is regression-tested (`skip_no_device_gate_is_sound`, r2
+  P1 — its first cut recursed).
 
 ## [0.1.2] — 2026-10-10
 

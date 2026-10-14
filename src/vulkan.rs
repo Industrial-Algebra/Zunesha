@@ -1370,7 +1370,26 @@ mod tests {
             std::env::var("ZUNESHA_REQUIRE_VULKAN").is_err(),
             "ZUNESHA_REQUIRE_VULKAN is set but Vulkan init failed: {e}"
         );
-        skip_no_device(e);
+        eprintln!("skipping: no Vulkan device ({e})");
+    }
+
+    /// r2 P1 regression: the gate must (a) hard-fail under
+    /// `ZUNESHA_REQUIRE_VULKAN` and (b) return normally when unset — its
+    /// first cut recursed into itself (a textual replace hit the helper's
+    /// own diagnostic line), which only manifests when an init actually
+    /// fails; green llvmpipe CI never exercised it.
+    #[test]
+    #[serial]
+    fn skip_no_device_gate_is_sound() {
+        // (a) required mode panics.
+        unsafe { std::env::set_var("ZUNESHA_REQUIRE_VULKAN", "1") };
+        let r = std::panic::catch_unwind(|| skip_no_device(DeviceError::NoDevice));
+        unsafe { std::env::remove_var("ZUNESHA_REQUIRE_VULKAN") };
+        assert!(r.is_err(), "require mode must hard-fail on init failure");
+
+        // (b) unset mode returns normally (regression would abort the test
+        // process via stack overflow — not catchable, correctly fatal).
+        skip_no_device(DeviceError::NoDevice);
     }
 
     /// A graphics-requested init selects a device exposing a graphics queue and
@@ -1633,7 +1652,7 @@ mod tests {
         let d2 = match VulkanDevice::init() {
             Ok(d) => std::sync::Arc::new(d),
             Err(e) => {
-                eprintln!("skipping: second device init ({e})");
+                skip_no_device(e);
                 return;
             }
         };
