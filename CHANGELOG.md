@@ -28,6 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking (0.x):** `with_dispatch` is a required `Device` trait
   method; `NoDeviceStub` implements it as the identity. No external
   implementors exist today.
+- **`ZUNESHA_REQUIRE_VULKAN` CI gate** (r1 P2): the Linux vulkan jobs now
+  install an ICD (llvmpipe) and hard-fail Vulkan test skips — previously
+  every Vulkan test silently skipped on ubuntu-latest (no ICD installed),
+  so green never proved execution. Mirrors `ZUNESHA_REQUIRE_METAL`.
 
 ## [0.1.2] — 2026-10-10
 
