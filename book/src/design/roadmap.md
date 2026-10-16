@@ -30,13 +30,20 @@
       modes, escape hatches, `ZUNESHA_REQUIRE_METAL` CI. Verified on
       Apple M5 Max; ships with the next release. Unblocks Borsalino-Metal's
       staged migration.
-
+- [x] **Dispatch-scope guard** (ADR 0005 Phase 1) — landed on
+      `feat/dispatch-guard`: `Device::with_dispatch` epoch accounting on
+      both backends, `with_compute_queue` becomes a tracked scope,
+      panic-safe retirement via the tracker's `scope`. Ships with the
+      next release.
 - [ ] **Borsalino migration** — Borsalino consumes Zunesha, deletes its own
       epoch tracker + device layer. The substrate's reason to exist; makes
-      ADR 0001 fully true. Requires exposing a consumer-callable
-      dispatch-scope guard (see `RABBIT_HOLE_2026-09-02` Thread B).
+      ADR 0001 fully true. The dispatch-scope guard prerequisite is now
+      provided (ADR 0005); the migration routes its submissions through
+      `with_dispatch` and relies on the ADR's normative epoch-gated
+      teardown (never blanket `device_wait_idle`).
 - [ ] **`verify` feature** — karpal-verify obligation bundles for buffer
       alignment + quiescence (ADR 0003's Zunesha row becomes load-bearing).
+      The guard makes `prove_quiescent` real observability for it.
 
 ## Speculative — bannered
 
@@ -44,10 +51,14 @@
 > 0001's reversibility clause. (The Metal backend moved out of this
 > section — see Pending above.)
 
-- [ ] **Cross-queue synchronization** (candidate ADR 0005) — queue-family
-      release/acquire (or timeline semaphores) for `EXCLUSIVE` buffers
-      crossing compute↔graphics families. Unowned today; safe only while
+- [ ] **Cross-queue synchronization** — **designed in ADR 0005 Phase 2,
+      deliberately not landed** (no graphics consumer yet): queue-family
+      release/acquire under the submission protocol for `EXCLUSIVE`
+      buffers crossing compute↔graphics, via a per-buffer ownership ledger
+      and an explicit `transfer_ownership` call. Safe today only while
       everything is host-synchronous (the 09-02 rabbit hole's "who orders
-      the queues?"). Becomes load-bearing the moment dispatch goes async.
+      the queues?"). Becomes load-bearing the moment dispatch goes async;
+      the ADR records timeline semaphores as the natural successor when
+      that happens.
 - [ ] **Multi-device topologies** — explicit render-iGPU / compute-dGPU
       pairing beyond `device_hint` substring matching.

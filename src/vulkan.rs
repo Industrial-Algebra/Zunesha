@@ -1221,8 +1221,10 @@ impl VulkanDevice {
         // Per-protocol reentrancy + cross-thread exclusion live in
         // [`TransferProtocol::enter`] (reviews r5+r6 P1s: same-device
         // nested entry must not deadlock; another device's lock must
-        // still be acquired).
-        self.protocol.enter(|| f(self.compute_queue))
+        // still be acquired). ADR 0005 §2: the hatch is itself a tracked
+        // scope — entering begins an epoch, exit (or unwind) retires it.
+        self.protocol
+            .enter(|| self.epoch.scope(|| f(self.compute_queue)))
     }
 }
 
@@ -1343,6 +1345,13 @@ impl Device for VulkanDevice {
     fn is_quiescent(&self) -> bool {
         self.epoch.is_quiescent()
     }
+
+    /// ADR 0005 §2: the scope joins the submission protocol, so a quiesce
+    /// cannot interleave between a consumer's epoch-begin and its submit.
+    /// The raw `with_compute_queue` hatch is itself a tracked scope.
+    fn with_dispatch<R>(&self, f: impl FnOnce() -> R) -> R {
+        self.protocol.enter(|| self.epoch.scope(f))
+    }
 }
 
 #[cfg(test)]
@@ -1350,6 +1359,68 @@ mod tests {
     use super::*;
     use crate::Device;
     use serial_test::serial;
+
+    /// Skip politely on init failure — but FAIL hard when
+    /// `ZUNESHA_REQUIRE_VULKAN` is set: the CI job that sets it installs an
+    /// ICD (llvmpipe) and must never pass without touching a real Vulkan
+    /// device — the `ZUNESHA_REQUIRE_METAL` pattern, ported (PR #17 r1 P2:
+    /// green-with-skips is vacuous coverage).
+    fn skip_no_device(e: DeviceError) {
+        assert!(
+            std::env::var("ZUNESHA_REQUIRE_VULKAN").is_err(),
+            "ZUNESHA_REQUIRE_VULKAN is set but Vulkan init failed: {e}"
+        );
+        eprintln!("skipping: no Vulkan device ({e})");
+    }
+
+    /// r2 P1 regression / r3 P1 isolation: both gate modes are exercised
+    /// in SUBPROCESSES. Mutating this process's env — as the first cut did
+    /// with `remove_var` — would (de)arm the gate for every later test in
+    /// the process (r3: under `ZUNESHA_REQUIRE_VULKAN=1` CI, a later init
+    /// failure silently skipped); `#[serial]` cannot contain env state.
+    /// The armed subprocess must panic (non-zero exit), the unset one must
+    /// return cleanly (zero) — the recursion regression (r2) aborts both,
+    /// so it cannot pass this test.
+    #[test]
+    #[serial]
+    fn skip_no_device_gate_is_sound() {
+        let exe = std::env::current_exe().expect("test binary path");
+        for (label, armed) in [("armed", true), ("ambient-unset", false)] {
+            let mut cmd = std::process::Command::new(&exe);
+            cmd.args(["skip_no_device_gate_mode_probe", "--test-threads=1"])
+                .env("ZUNESHA_GATE_DRIVER", "1");
+            if armed {
+                cmd.env("ZUNESHA_REQUIRE_VULKAN", "1");
+            } else {
+                // Unset — an empty value would still read as present to
+                // `env::var`, arming the gate.
+                cmd.env_remove("ZUNESHA_REQUIRE_VULKAN");
+            }
+            let out = cmd.output().expect("spawn test binary");
+            let exited = out.status.success();
+            assert_eq!(
+                exited,
+                !armed,
+                "{label}: expected {}",
+                if armed {
+                    "panic / non-zero exit"
+                } else {
+                    "clean zero exit"
+                }
+            );
+        }
+    }
+
+    /// Probe driven by [`skip_no_device_gate_is_sound`] via re-exec with a
+    /// tailored environment. Run directly (no `ZUNESHA_GATE_DRIVER`), it is
+    /// a no-op — the ambient environment decides nothing here.
+    #[test]
+    fn skip_no_device_gate_mode_probe() {
+        if std::env::var("ZUNESHA_GATE_DRIVER").is_err() {
+            return;
+        }
+        skip_no_device(DeviceError::NoDevice);
+    }
 
     /// A graphics-requested init selects a device exposing a graphics queue and
     /// supporting `VK_KHR_swapchain` (the rendering prerequisite). On a
@@ -1376,7 +1447,7 @@ mod tests {
         let unified = match VulkanDevice::init_with_strategy(MemoryStrategy::Unified) {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("skipping: no Vulkan device ({e})");
+                skip_no_device(e);
                 return;
             }
         };
@@ -1386,7 +1457,7 @@ mod tests {
         let discrete = match VulkanDevice::init_with_strategy(MemoryStrategy::DeviceLocal) {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("skipping: no Vulkan device ({e})");
+                skip_no_device(e);
                 return;
             }
         };
@@ -1396,7 +1467,7 @@ mod tests {
         let auto = match VulkanDevice::init() {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("skipping: no Vulkan device ({e})");
+                skip_no_device(e);
                 return;
             }
         };
@@ -1416,7 +1487,7 @@ mod tests {
         let device = match VulkanDevice::init_with(pinned(InitRequest::prefer_graphics())) {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("skipping: no Vulkan device ({e})");
+                skip_no_device(e);
                 return;
             }
         };
@@ -1450,7 +1521,7 @@ mod tests {
         let device = match VulkanDevice::init() {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("skipping: no Vulkan device available ({e})");
+                skip_no_device(e);
                 return;
             }
         };
@@ -1469,7 +1540,7 @@ mod tests {
         let device = match VulkanDevice::init() {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("skipping: no Vulkan device ({e})");
+                skip_no_device(e);
                 return;
             }
         };
@@ -1508,7 +1579,7 @@ mod tests {
         let device = match VulkanDevice::init_with_strategy(MemoryStrategy::Unified) {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("skipping: no Vulkan device ({e})");
+                skip_no_device(e);
                 return;
             }
         };
@@ -1526,7 +1597,7 @@ mod tests {
         let device = match VulkanDevice::init_with_strategy(MemoryStrategy::DeviceLocal) {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("skipping: no Vulkan device ({e})");
+                skip_no_device(e);
                 return;
             }
         };
@@ -1551,7 +1622,7 @@ mod tests {
         let device = match VulkanDevice::init() {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("skipping: no Vulkan device ({e})");
+                skip_no_device(e);
                 return;
             }
         };
@@ -1568,7 +1639,7 @@ mod tests {
         let device = match VulkanDevice::init_with(pinned(InitRequest::prefer_graphics())) {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("skipping: no Vulkan device ({e})");
+                skip_no_device(e);
                 return;
             }
         };
@@ -1604,14 +1675,14 @@ mod tests {
         let d1 = match VulkanDevice::init() {
             Ok(d) => std::sync::Arc::new(d),
             Err(e) => {
-                eprintln!("skipping: no Vulkan device ({e})");
+                skip_no_device(e);
                 return;
             }
         };
         let d2 = match VulkanDevice::init() {
             Ok(d) => std::sync::Arc::new(d),
             Err(e) => {
-                eprintln!("skipping: second device init ({e})");
+                skip_no_device(e);
                 return;
             }
         };
@@ -1664,7 +1735,7 @@ mod tests {
         let device = match VulkanDevice::init() {
             Ok(d) => std::sync::Arc::new(d),
             Err(e) => {
-                eprintln!("skipping: no Vulkan device ({e})");
+                skip_no_device(e);
                 return;
             }
         };
@@ -1688,7 +1759,7 @@ mod tests {
         let device = std::sync::Arc::new(match VulkanDevice::init() {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("skipping: no Vulkan device ({e})");
+                skip_no_device(e);
                 return;
             }
         });
@@ -1724,7 +1795,7 @@ mod tests {
         let device = match VulkanDevice::init_with_strategy(MemoryStrategy::Unified) {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("skipping: no Vulkan device ({e})");
+                skip_no_device(e);
                 return;
             }
         };
@@ -1767,5 +1838,95 @@ mod tests {
         let r2: Vec<f32> = device.read_buffer(&forced).unwrap();
         assert_eq!(r1, vec![1.0, 2.0, 3.0, 4.0]);
         assert_eq!(r2, vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    // ── ADR 0005: dispatch-scope guard ────────────────────────────
+
+    /// A `with_dispatch` scope counts exactly one in-flight epoch while
+    /// running and none after (ADR 0005 §2).
+    #[test]
+    fn with_dispatch_counts_one_epoch() {
+        let device = match VulkanDevice::init() {
+            Ok(d) => d,
+            Err(e) => {
+                skip_no_device(e);
+                return;
+            }
+        };
+        assert_eq!(device.in_flight(), 0, "precondition: quiescent");
+        let seen = device.with_dispatch(|| device.in_flight());
+        assert_eq!(seen, 1, "inside the scope exactly one epoch is in flight");
+        assert_eq!(device.in_flight(), 0, "scope exit retires the epoch");
+    }
+
+    /// Nested scopes are legal and count depth — the tracker is a
+    /// counter, not a boolean (ADR 0005 §2, reentrancy).
+    #[test]
+    fn nested_dispatch_scopes_count_depth() {
+        let device = match VulkanDevice::init() {
+            Ok(d) => d,
+            Err(e) => {
+                skip_no_device(e);
+                return;
+            }
+        };
+        let seen = device.with_dispatch(|| {
+            assert_eq!(device.in_flight(), 1);
+            device.with_dispatch(|| device.in_flight())
+        });
+        assert_eq!(seen, 2, "inner scope sees two in-flight epochs");
+        assert_eq!(device.in_flight(), 0);
+    }
+
+    /// A panicking consumer cannot stick an epoch: the guard ends the
+    /// dispatch on unwind (ADR 0005 §2).
+    #[test]
+    fn panicking_dispatch_scope_cannot_stick_an_epoch() {
+        let device = match VulkanDevice::init() {
+            Ok(d) => d,
+            Err(e) => {
+                skip_no_device(e);
+                return;
+            }
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            device.with_dispatch(|| panic!("consumer dispatch panicked"));
+        }));
+        assert!(result.is_err(), "test must observe the panic itself");
+        assert_eq!(device.in_flight(), 0, "unwind must retire the epoch");
+    }
+
+    /// Quiescence proof is gated by live epochs: `None` inside a scope,
+    /// `Some` outside (ADR 0005 §2).
+    #[test]
+    fn prove_quiescent_gated_by_dispatch_scope() {
+        let device = match VulkanDevice::init() {
+            Ok(d) => d,
+            Err(e) => {
+                skip_no_device(e);
+                return;
+            }
+        };
+        let seen = device.with_dispatch(|| device.prove_quiescent());
+        assert!(seen.is_none(), "inside a scope the device is not quiescent");
+        assert!(device.prove_quiescent().is_some());
+    }
+
+    /// The raw-queue escape hatch is itself a tracked scope: entering
+    /// `with_compute_queue` begins an epoch, exit retires it (ADR 0005
+    /// §2 — consumers do not nest the two).
+    #[test]
+    fn with_compute_queue_is_a_tracked_scope() {
+        let device = match VulkanDevice::init() {
+            Ok(d) => d,
+            Err(e) => {
+                skip_no_device(e);
+                return;
+            }
+        };
+        assert_eq!(device.in_flight(), 0);
+        let seen = device.with_compute_queue(|_q| device.in_flight());
+        assert_eq!(seen, 1, "raw queue access counts one epoch while held");
+        assert_eq!(device.in_flight(), 0);
     }
 }
