@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-10-19
+
+### Added — dispatch-scope guard (ADR 0005 Phase 1)
+
+- **`Device::with_dispatch`** — the consumer dispatch-scope guard: run a
+  submission (and its settle) inside the scope and `in_flight()` /
+  `is_quiescent()` / `prove_quiescent()` account for it on both backends.
+  Implemented on the `GpuEpochTracker`'s new panic-safe `scope`; nesting
+  counts depth; unwind retires the epoch.
+- **`with_compute_queue` (Vulkan) is now a tracked scope** — entering the
+  raw-queue hatch begins an epoch, exit retires it; consumers do not
+  nest it inside `with_dispatch`.
+- On Vulkan the scope joins the `SubmissionProtocol` (a quiesce cannot
+  interleave between epoch-begin and submit); on Metal it is pure epoch
+  accounting (documented thread-safe queue, ADR 0004 §4).
+- ADR 0005 records Borsalino's teardown constraint as normative —
+  epoch-gated quiesce, never blanket `device_wait_idle` — and designs
+  cross-queue ownership transfer (per-buffer ledger + release/acquire
+  barriers) as Phase 2: **designed, not landed**, per ADR 0001's
+  reversibility clause.
+- **Breaking (0.x):** `with_dispatch` is a required `Device` trait
+  method; `NoDeviceStub` implements it as the identity. No external
+  implementors exist today.
+- **`ZUNESHA_REQUIRE_VULKAN` CI gate** (r1 P2): the Linux vulkan jobs now
+  install an ICD (llvmpipe) and hard-fail on device-init failure —
+  previously every Vulkan test silently skipped on ubuntu-latest (no ICD
+  installed), so green never proved execution. Mirrors
+  `ZUNESHA_REQUIRE_METAL`. Capability-degradation reporting (successful
+  init, missing optional queue) still reports rather than fails; the
+  gate helper is regression-tested (`skip_no_device_gate_is_sound`, r2
+  P1 — its first cut recursed).
+
 ## [0.1.2] — 2026-10-10
 
 ### Fixed — allocation-failure cleanup (2026-10-10)
@@ -66,6 +98,35 @@ Runtime fault injection is not feasible in a unit test (ash exposes no
 mock layer and a test-only allocator seam is out of patch scope); the
 cleanup is verified by construction and code review, matching the
 discipline Borsalino adopted for the same shapes.
+
+### Added — Metal backend (ADR 0004)
+
+- **`metal` feature** (macOS, `dep:objc`): `MetalDevice` implementing
+  `Device` — ADR-0004 queue reinterpretation (the owned MTLCommandQueue
+  services compute + graphics; transfer `None`), `MTLCopyAllDevices`
+  device-hint matching, Shared and Private + staging storage modes,
+  `create_device_buffer` mandatory override (forces Private regardless of
+  strategy), escape hatches (`raw_device`, `raw_buffer`, `command_queue`),
+  pools on every objc-minting path, and `ZUNESHA_REQUIRE_METAL` CI
+  semantics. Verified on Apple M5 Max (18 Metal tests; 35-test suite green under `ZUNESHA_REQUIRE_METAL=1`).
+- **macOS CI** — self-hosted `test-macos` job (hantaro fleet recipe) with
+  `ZUNESHA_REQUIRE_METAL=1`.
+- **Examples** — `device-info-metal`, `buffer-roundtrip-metal` (with
+  non-macOS fallback builds).
+
+### Fixed — Metal backend review round 1 (2026-10-10)
+
+- Typed readback over Metal `contents()` mappings was UB for over-aligned
+  `Pod` types — replaced by an aligned byte-copy (`collect_aligned`).
+- Per-device readback locking was bypassable by second `MetalDevice`
+  instances sharing the MTLDevice singleton — synchronization moved into
+  per-buffer state, and genuinely foreign-device reads are rejected.
+- Allocation arithmetic could panic (debug) or wrap (release) on overflow —
+  now checked, erroring `BufferCreationFailed` in every profile.
+- `--features metal --all-targets` now compiles on Linux (example bodies
+  gated with a fallback `main`).
+- Known follow-up: the Vulkan backend carries the same readback-cast and
+  overflow patterns structurally — separate fix, tracked for its own PR.
 
 ## [0.1.1] — 2026-10-10
 

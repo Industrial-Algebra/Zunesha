@@ -5,7 +5,7 @@ Add Zunesha with the backend feature for your platform:
 ```toml
 [dependencies]
 zunesha = { version = "0.1", features = ["vulkan"] }   # Linux / Windows
-# zunesha = { version = "0.1", features = ["metal"] }  # macOS (post-v0.1)
+# zunesha = { version = "0.1", features = ["metal"] }  # macOS
 ```
 
 ## Baseline use
@@ -48,6 +48,9 @@ cargo run --example quiescence
 # GPU-backed: require the vulkan feature and a real device.
 cargo run --features vulkan --example device-info
 cargo run --features vulkan --example buffer-roundtrip
+# macOS:
+cargo run --features metal --example device-info-metal
+cargo run --features metal --example buffer-roundtrip-metal
 ```
 
 See the [Examples](./examples/quiescence.md) section for walkthroughs.
