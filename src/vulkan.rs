@@ -487,7 +487,13 @@ impl VulkanDevice {
     /// backend's buffer) are reported as not-owned: the discriminant is the
     /// drop function pointer.
     pub fn owns_buffer(&self, buffer: &crate::Buffer) -> bool {
-        if buffer.drop_fn != drop_vulkan_buffer {
+        // `fn_addr_eq` — the std-blessed function-pointer identity test
+        // (plain `!=` is `unpredictable-function-pointer-comparisons`
+        // under newer clippy). Only one backend's drop fn exists in any
+        // given binary (the backends are target-exclusive), so a
+        // foreign-box false positive is not constructible here; the test
+        // stays as belt-and-suspenders and documents intent.
+        if !std::ptr::fn_addr_eq(buffer.drop_fn, drop_vulkan_buffer as fn(*mut c_void)) {
             return false; // not a Vulkan-backend buffer
         }
         // Safety: the drop_fn discriminant proves the box is a
