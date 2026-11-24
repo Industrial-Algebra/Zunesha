@@ -477,6 +477,25 @@ unsafe fn allocate_device_local_buffer(
 /// loss nor of completion), so reclaiming them would be a driver-level
 /// use-after-free. The sound side is to leak (review r2 P1).
 impl VulkanDevice {
+    /// Reports whether `buffer` was created by THIS device.
+    ///
+    /// Closes the opaque-handle trust boundary for buffer adoption across
+    /// crates (Goldenweek's M3 `import_zunesha_buffer` documents it): a
+    /// buffer from another `VulkanDevice` — another `vk::Device` — is
+    /// rejected by consumers before any Vulkan command that would hit
+    /// VUID-vkCmdBindVertexBuffers-commonparent. Non-Vulkan boxes (a Metal
+    /// backend's buffer) are reported as not-owned: the discriminant is the
+    /// drop function pointer.
+    pub fn owns_buffer(&self, buffer: &crate::Buffer) -> bool {
+        if buffer.drop_fn != drop_vulkan_buffer {
+            return false; // not a Vulkan-backend buffer
+        }
+        // Safety: the drop_fn discriminant proves the box is a
+        // VulkanBufferInner.
+        let inner = unsafe { &*(buffer.raw as *const VulkanBufferInner) };
+        inner.device.handle() == self.device.handle()
+    }
+
     /// One-shot transfer. The error's `bool` is **"submission reached the
     /// GPU"**: `false` means nothing was submitted (allocate/begin/end/
     /// submit failed — the recorded resources are untouched and safe to
@@ -1479,6 +1498,30 @@ mod tests {
             ),
             "Auto must resolve to a concrete placement on any hardware"
         );
+    }
+
+    /// Buffer ownership (Goldenweek M3 follow-up): a buffer answers to
+    /// the device that created it, and only that device.
+    #[test]
+    #[serial]
+    fn owns_buffer_distinguishes_devices() {
+        let a = match VulkanDevice::init_with(pinned(InitRequest::prefer_graphics())) {
+            Ok(d) => d,
+            Err(e) => {
+                skip_no_device(e);
+                return;
+            }
+        };
+        let b = match VulkanDevice::init_with(pinned(InitRequest::prefer_graphics())) {
+            Ok(d) => d,
+            Err(e) => {
+                skip_no_device(e);
+                return;
+            }
+        };
+        let buf = a.create_buffer(&[1u32, 2, 3, 4]).expect("buffer");
+        assert!(a.owns_buffer(&buf), "creator owns");
+        assert!(!b.owns_buffer(&buf), "second device does not own");
     }
 
     #[test]
