@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — buffer provenance
+
+- **`VulkanDevice::owns_buffer`** — reports whether a `Buffer` was created
+  by this device (drop-function discriminant via `fn_addr_eq` + logical
+  device handle comparison). Closes the opaque-handle trust boundary that
+  Goldenweek's M3 `import_zunesha_buffer` documented: a buffer adopted
+  from another `VulkanDevice` would otherwise reach
+  `vkCmdBindVertexBuffers` and violate VUID common-parent. Non-Vulkan
+  boxes report not-owned rather than mis-unboxing (the discriminant fires
+  first); with target-exclusive backends the cross-backend case is not
+  constructible in a binary.
+
 ## [0.2.0] — 2026-10-19
 
 ### Added — dispatch-scope guard (ADR 0005 Phase 1)
